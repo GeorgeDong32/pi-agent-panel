@@ -1,0 +1,40 @@
+{
+  "name": "pi-agent-panel",
+  "version": "0.1.0",
+  "description": "Actionable multi-agent fleet panel for the pi coding agent: spawn, watch, interrupt and stop headless child pi sessions from a single TUI overlay",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "agents",
+    "fleet",
+    "tui"
+  ],
+  "license": "MIT",
+  "author": "GeorgeDong32",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "files": [
+    "extensions",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/unit/*.test.ts",
+    "test:contract": "node --test test/contract/*.test.ts",
+    "test:integration": "node --test test/integration/*.test.ts",
+    "test:all": "pnpm test && pnpm test:contract && pnpm test:integration",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-tui": "0.85.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}

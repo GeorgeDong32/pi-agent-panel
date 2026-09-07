@@ -1,295 +1,244 @@
 /**
- * Fake ProcessRunner + supervisor unit tests. No real processes, no network.
+ * FleetSupervisor unit tests against the scripted FakeRpcSession. No real
+ * processes, no network — everything below drives the seam.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { readFileSync } from "node:fs";
 import test from "node:test";
-import { FleetSupervisor } from "../../extensions/lib/supervisor.ts";
-import type { ChildProcessHandle, ProcessRunner } from "../../extensions/lib/types.ts";
+import { createHarness, emitTurn, FakeRpcSession, waitFor } from "./fake-rpc.ts";
+import { groupOf } from "../../extensions/lib/supervisor.ts";
+import type { SupervisorEvent } from "../../extensions/lib/types.ts";
 
-class FakeProc implements ChildProcessHandle {
-	pid: number;
-	signals: string[] = [];
-	exited: Promise<number>;
-	/** Single long-lived iterator, mirroring a real child's stdout stream. */
-	readonly stdout: AsyncGenerator<string>;
-	private exitResolve!: (code: number) => void;
-	private queue: string[] = [];
-	private wake: (() => void) | undefined;
-	private closed = false;
-
-	static nextPid = 41000;
-
-	constructor(pid: number) {
-		this.pid = pid;
-		this.exited = new Promise((resolve) => {
-			this.exitResolve = resolve;
-		});
-		this.stdout = this.streamLines();
-	}
-
-	emit(line: string): void {
-		this.queue.push(line);
-		this.wake?.();
-	}
-
-	exit(code: number): void {
-		this.closed = true;
-		this.exitResolve(code);
-		this.wake?.();
-	}
-
-	kill(signal?: NodeJS.Signals): void {
-		this.signals.push(signal ?? "SIGTERM");
-	}
-
-	private async *streamLines(): AsyncGenerator<string> {
-		let index = 0;
-		for (;;) {
-			while (index < this.queue.length) {
-				yield this.queue[index] as string;
-				index += 1;
-			}
-			if (this.closed && index >= this.queue.length) return;
-			await new Promise<void>((resolve) => {
-				this.wake = resolve;
-			});
-			this.wake = undefined;
-		}
-	}
-}
-
-function createHarness(options: { limit?: number; stopGraceMs?: number } = {}) {
-	const procs: FakeProc[] = [];
-	const runner: ProcessRunner = {
-		spawn: (_command, _args, _opts) => {
-			const proc = new FakeProc(FakeProc.nextPid++);
-			procs.push(proc);
-			return proc;
-		},
-	};
-	const rootDir = mkdtempSync(path.join(tmpdir(), "agent-panel-test-"));
-	const supervisor = new FleetSupervisor({
-		runner,
-		rootDir,
-		drainMs: 20,
-		stopGraceMs: options.stopGraceMs ?? 50,
-		...(options.limit !== undefined ? { limit: options.limit } : {}),
-	});
-	return { supervisor, procs, rootDir };
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs = 2000, message = "condition"): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await new Promise((resolve) => setTimeout(resolve, 10));
-	}
-	throw new Error(`timeout waiting for ${message}`);
-}
-
-function sessionLine(): string {
-	return JSON.stringify({ type: "session", version: 3, id: "s1", cwd: "/tmp" });
-}
-
-function assistantEnd(text: string, usage: { input: number; output: number }, stopReason = "stop"): string {
-	return JSON.stringify({
-		type: "message_end",
-		message: {
-			role: "assistant",
-			content: [{ type: "text", text }],
-			usage: { input: usage.input, output: usage.output, cost: { total: 0.01 } },
-			stopReason,
-		},
-	});
-}
-
-test("spawn creates child artifacts and emits agent-added in starting state", () => {
-	const { supervisor } = createHarness();
+test("spawn starts a session, aligns to awaiting-input, emits agent-added", async () => {
+	const { supervisor, sessions } = createHarness();
 	const events: string[] = [];
 	supervisor.onEvent((event) => events.push(event.type));
-	const handle = supervisor.spawn({ name: "alpha", prompt: "do stuff", cwd: "/tmp" });
-	assert.equal(handle.state, "starting");
-	assert.equal(handle.name, "alpha");
+	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	assert.equal(handle.state, "awaiting-input");
 	assert.ok(handle.sessionFile.endsWith("session.jsonl"));
 	assert.ok(handle.eventsFile.endsWith("events.jsonl"));
-	assert.deepEqual(events, ["agent-added"]);
+	assert.equal(sessions.length, 1);
+	assert.equal(sessions[0]?.createdOptions.cwd, "/tmp");
+	assert.equal(sessions[0]?.createdOptions.sessionFile, handle.sessionFile);
+	assert.deepEqual(events, ["agent-added", "agent-updated"]);
 });
 
-test("first parsed event transitions starting → running", async () => {
-	const { supervisor, procs } = createHarness();
-	supervisor.spawn({ name: "alpha", prompt: "x", cwd: "/tmp" });
-	procs[0]?.emit(sessionLine());
-	await waitFor(() => supervisor.list()[0]?.state === "running", 1000, "running");
+test("spawn forwards model to the session factory", async () => {
+	const { supervisor, sessions } = createHarness();
+	await supervisor.spawn({ name: "m", cwd: "/tmp", model: "prov/model-x" });
+	assert.equal(sessions[0]?.createdOptions.model, "prov/model-x");
 });
 
-test("assistant message_end aggregates tokens and lastLine", async () => {
-	const { supervisor, procs } = createHarness();
-	supervisor.spawn({ name: "alpha", prompt: "x", cwd: "/tmp" });
-	const proc = procs[0] as FakeProc;
-	proc.emit(sessionLine());
-	proc.emit(assistantEnd("hello world", { input: 100, output: 20 }));
-	await waitFor(() => (supervisor.list()[0]?.lastLine ?? "") === "hello world", 1000, "lastLine");
-	const handle = supervisor.list()[0];
-	assert.equal(handle?.tokens.input, 100);
-	assert.equal(handle?.tokens.output, 20);
-	assert.equal(handle?.tokens.cost, 0.01);
-	assert.equal(handle?.state, "running");
+test("spawn with prompt sends the first message as background", async () => {
+	const { supervisor, sessions } = createHarness();
+	await supervisor.spawn({ name: "alpha", cwd: "/tmp", prompt: "do stuff" });
+	assert.deepEqual(sessions[0]?.sends, [{ text: "do stuff", kind: "prompt" }]);
+	// The turn events then flip the handle to working.
+	sessions[0]?.emit({ type: "agent_start" });
+	await waitFor(() => supervisor.list()[0]?.state === "working", 1000, "working");
+});
+
+test("agent_start/agent_end drive working ⇄ awaiting-input and emit turn-ended", async () => {
+	const { supervisor, sessions } = createHarness();
+	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	const turns: SupervisorEvent[] = [];
+	supervisor.onEvent((event) => {
+		if (event.type === "turn-ended") turns.push(event);
+	});
+	const session = sessions[0] as FakeRpcSession;
+	emitTurn(session, "hi", "hello world");
+	await waitFor(() => supervisor.list()[0]?.state === "awaiting-input", 1000, "back to awaiting");
+	const after = supervisor.list()[0];
+	assert.equal(after?.turnCount, 1);
+	assert.equal(after?.lastLine, "hello world");
+	assert.equal(after?.tokens.input, 10);
+	assert.equal(after?.tokens.output, 5);
+	assert.equal(after?.tokens.cost, 0.01);
+	assert.equal(turns.length, 1);
+	assert.equal(turns[0]?.type === "turn-ended" && turns[0].origin, "background");
+	assert.equal(turns[0]?.type === "turn-ended" && turns[0].handle.id, handle.id);
+});
+
+test("agent_end with willRetry does not end the turn", async () => {
+	const { supervisor, sessions } = createHarness();
+	await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	const turns: SupervisorEvent[] = [];
+	supervisor.onEvent((event) => {
+		if (event.type === "turn-ended") turns.push(event);
+	});
+	const session = sessions[0] as FakeRpcSession;
+	session.emit({ type: "agent_start" });
+	session.emit({ type: "agent_end", willRetry: true });
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	assert.equal(turns.length, 0);
+	assert.equal(supervisor.list()[0]?.state, "working");
 });
 
 test("tool events update toolCount and currentTool", async () => {
-	const { supervisor, procs } = createHarness();
-	supervisor.spawn({ name: "alpha", prompt: "x", cwd: "/tmp" });
-	const proc = procs[0] as FakeProc;
-	proc.emit(sessionLine());
-	proc.emit(JSON.stringify({ type: "tool_execution_start", toolName: "bash" }));
+	const { supervisor, sessions } = createHarness();
+	await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	const session = sessions[0] as FakeRpcSession;
+	session.emit({ type: "tool_execution_start", toolName: "bash" });
 	await waitFor(() => supervisor.list()[0]?.currentTool === "bash", 1000, "currentTool");
-	proc.emit(JSON.stringify({ type: "tool_execution_end" }));
+	session.emit({ type: "tool_execution_end" });
 	await waitFor(() => supervisor.list()[0]?.currentTool === undefined, 1000, "currentTool cleared");
 	assert.equal(supervisor.list()[0]?.toolCount, 1);
 });
 
-test("exit 0 → completed with exactly one agent-final", async () => {
-	const { supervisor, procs } = createHarness();
-	const finals: string[] = [];
+test("prompt while idle sends prompt; while working auto-degrades to steer and tags origin", async () => {
+	const { supervisor, sessions } = createHarness();
+	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	const session = sessions[0] as FakeRpcSession;
+	assert.equal(await supervisor.prompt(handle.id, "first question", "panel"), true);
+	assert.deepEqual(session.sends, [{ text: "first question", kind: "prompt" }]);
+	session.emit({ type: "agent_start" });
+	await waitFor(() => supervisor.list()[0]?.state === "working", 1000, "working");
+	assert.equal(await supervisor.prompt(handle.id, "mid-turn nudge", "panel"), true);
+	assert.deepEqual(session.sends[1], { text: "mid-turn nudge", kind: "steer" });
+	// The turn that started from the panel carries origin "panel".
+	const origins: string[] = [];
 	supervisor.onEvent((event) => {
-		if (event.type === "agent-final") finals.push(event.handle.id);
+		if (event.type === "turn-ended") origins.push(event.origin);
 	});
-	const handle = supervisor.spawn({ name: "alpha", prompt: "x", cwd: "/tmp" });
-	const proc = procs[0] as FakeProc;
-	proc.emit(sessionLine());
-	proc.emit(assistantEnd("done", { input: 10, output: 5 }));
-	proc.exit(0);
-	await waitFor(() => supervisor.list()[0]?.state === "completed", 1000, "completed");
-	assert.equal(finals.length, 1);
-	assert.equal(finals[0], handle.id);
-	assert.equal(supervisor.list()[0]?.exitCode, 0);
-	assert.ok(supervisor.list()[0]?.endedAt);
+	emitTurn(session, "first question", "answer");
+	assert.deepEqual(origins, ["panel"]);
+	// prompt on unknown/dead agents is a clean false, not a throw.
+	assert.equal(await supervisor.prompt("missing", "x"), false);
 });
 
-test("exit non-zero → failed", async () => {
-	const { supervisor, procs } = createHarness();
-	supervisor.spawn({ name: "alpha", prompt: "x", cwd: "/tmp" });
-	(procs[0] as FakeProc).exit(1);
-	await waitFor(() => supervisor.list()[0]?.state === "failed", 1000, "failed");
+test("abort forwards to the session only while live", async () => {
+	const { supervisor, sessions } = createHarness();
+	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	const session = sessions[0] as FakeRpcSession;
+	assert.equal(await supervisor.abort(handle.id), true);
+	assert.equal(session.aborts, 1);
+	await supervisor.archive(handle.id);
+	assert.equal(await supervisor.abort(handle.id), false);
+	assert.equal(session.aborts, 1);
 });
 
-test("stop marks stopped even when the process dies from the signal", async () => {
-	const { supervisor, procs } = createHarness();
-	supervisor.spawn({ name: "alpha", prompt: "x", cwd: "/tmp" });
-	const proc = procs[0] as FakeProc;
-	proc.emit(sessionLine());
-	assert.equal(supervisor.stop(supervisor.list()[0]?.id as string), true);
-	assert.deepEqual(proc.signals, ["SIGINT"]);
-	proc.exit(130);
-	await waitFor(() => supervisor.list()[0]?.state === "stopped", 1000, "stopped");
+test("archive hides from live groups, stops the process, keeps the record, persists state.json", async () => {
+	const { supervisor, sessions, rootDir } = createHarness();
+	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	assert.equal(await supervisor.archive(handle.id), true);
+	const after = supervisor.list().find((h) => h.id === handle.id);
+	assert.equal(after?.state, "archived");
+	assert.ok(after?.endedAt);
+	assert.equal(groupOf(after.state), "archived");
+	const session = sessions[0] as FakeRpcSession;
+	assert.equal(session.stopCalls, 1);
+	// Archived ids persist for cross-restart hiding (revive-ready).
+	const state = JSON.parse(readFileSync(`${rootDir}/state.json`, "utf-8")) as { archivedIds: string[] };
+	assert.deepEqual(state.archivedIds, [handle.id]);
+	// Second archive is a no-op.
+	assert.equal(await supervisor.archive(handle.id), false);
+	// Events from a dying archived child are ignored.
+	session.emit({ type: "agent_start" });
+	assert.equal(supervisor.list()[0]?.state, "archived");
 });
 
-test("stop escalates to SIGKILL after the grace window", async () => {
-	const { supervisor, procs } = createHarness({ stopGraceMs: 30 });
-	supervisor.spawn({ name: "alpha", prompt: "x", cwd: "/tmp" });
-	const proc = procs[0] as FakeProc;
-	proc.emit(sessionLine());
-	supervisor.stop(supervisor.list()[0]?.id as string);
-	await waitFor(() => proc.signals.includes("SIGKILL"), 1000, "SIGKILL");
-	proc.exit(null as unknown as number);
-	await waitFor(() => supervisor.list()[0]?.state === "stopped", 1000, "stopped after SIGKILL");
-});
-
-test("interrupt sends SIGINT but a graceful exit still completes", async () => {
-	const { supervisor, procs } = createHarness();
-	supervisor.spawn({ name: "alpha", prompt: "x", cwd: "/tmp" });
-	const proc = procs[0] as FakeProc;
-	proc.emit(sessionLine());
-	assert.equal(supervisor.interrupt(supervisor.list()[0]?.id as string), true);
-	assert.deepEqual(proc.signals, ["SIGINT"]);
-	proc.emit(assistantEnd("wrapped up", { input: 1, output: 1 }));
-	proc.exit(0);
-	await waitFor(() => supervisor.list()[0]?.state === "completed", 1000, "completed after interrupt");
-});
-
-test("non-JSON stdout lines are tolerated", async () => {
-	const { supervisor, procs } = createHarness();
-	supervisor.spawn({ name: "alpha", prompt: "x", cwd: "/tmp" });
-	const proc = procs[0] as FakeProc;
-	proc.emit("this is not json at all");
-	proc.emit(sessionLine());
-	await waitFor(() => supervisor.list()[0]?.state === "running", 1000, "running despite noise");
-});
-
-test("limit rejects further spawns", () => {
-	const { supervisor } = createHarness({ limit: 1 });
-	supervisor.spawn({ name: "a", prompt: "x", cwd: "/tmp" });
-	assert.throws(() => supervisor.spawn({ name: "b", prompt: "x", cwd: "/tmp" }), /limit reached/);
-});
-
-test("duplicate live name rejected; reusable after terminal state", async () => {
-	const { supervisor, procs } = createHarness();
-	supervisor.spawn({ name: "dup", prompt: "x", cwd: "/tmp" });
-	assert.throws(() => supervisor.spawn({ name: "dup", prompt: "x", cwd: "/tmp" }), /already exists/);
-	(procs[0] as FakeProc).exit(0);
-	await waitFor(() => (supervisor.list()[0]?.endedAt ?? 0) > 0, 1000, "terminal");
-	const firstId = supervisor.list().find((h) => h.name === "dup")?.id;
-	const second = supervisor.spawn({ name: "dup", prompt: "x", cwd: "/tmp" });
-	assert.notEqual(second.id, firstId);
-});
-
-test("dispose kills live children with SIGKILL and is idempotent", async () => {
-	const { supervisor, procs } = createHarness();
-	supervisor.spawn({ name: "a", prompt: "x", cwd: "/tmp" });
-	supervisor.spawn({ name: "b", prompt: "x", cwd: "/tmp" });
-	supervisor.dispose();
-	for (const proc of procs) {
-		assert.ok(proc.signals.includes("SIGKILL"));
-	}
-	assert.doesNotThrow(() => supervisor.dispose());
-	assert.throws(() => supervisor.spawn({ name: "c", prompt: "x", cwd: "/tmp" }), /disposed/);
-});
-
-test("tail returns formatted readable lines and tolerates missing files", async () => {
-	const { supervisor, procs } = createHarness();
-	const handle = supervisor.spawn({ name: "alpha", prompt: "do the thing", cwd: "/tmp" });
-	const proc = procs[0] as FakeProc;
-	proc.emit(sessionLine());
-	proc.emit(JSON.stringify({ type: "message_end", message: { role: "user", content: [{ type: "text", text: "Task: do the thing" }] } }));
-	proc.emit(JSON.stringify({ type: "tool_execution_start", toolName: "read" }));
-	proc.emit(assistantEnd("working on it\nsecond line", { input: 1, output: 1 }));
-	await waitFor(() => supervisor.tail(handle.id, 50).length >= 3, 2000, "tail lines flushed");
-	const lines = supervisor.tail(handle.id, 2);
-	assert.deepEqual(lines, ["working on it", "second line"]);
+test("events are mirrored to events.jsonl and tail formats them", async () => {
+	const { supervisor, sessions } = createHarness();
+	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	const session = sessions[0] as FakeRpcSession;
+	emitTurn(session, "do the thing", "working on it\nsecond line");
+	session.emit({ type: "tool_execution_start", toolName: "read" });
+	session.emit({ type: "extension_ui_request", method: "confirm", title: "Allow write?" });
+	await waitFor(() => supervisor.tail(handle.id, 50).length >= 4, 2000, "mirror flush");
+	const lines = supervisor.tail(handle.id, 3);
+	assert.deepEqual(lines, ["second line", "⚙ read", "⚠ child ui request denied: Allow write?"]);
+	const all = supervisor.tail(handle.id, 50);
+	assert.ok(all.includes("▶ do the thing"), "user turn line");
+	assert.ok(all.some((line) => line.includes("ui request denied")), "denied ui request surfaced");
 	// Unknown id: IO-safe empty result.
 	assert.deepEqual(supervisor.tail("nope", 10), []);
 });
 
-test("steer is a documented not-implemented placeholder", () => {
+test("crash via failed probe flips state, emits agent-final exactly once", async () => {
+	const { supervisor, sessions } = createHarness({ probeMs: 15 });
+	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	const finals: string[] = [];
+	supervisor.onEvent((event) => {
+		if (event.type === "agent-final") finals.push(event.handle.id);
+	});
+	const session = sessions[0] as FakeRpcSession;
+	session.failNext = new Error("Agent process exited (code=1)");
+	await waitFor(() => supervisor.list()[0]?.state === "crashed", 2000, "crashed");
+	assert.equal(supervisor.list()[0]?.endedAt !== undefined, true);
+	assert.deepEqual(finals, [handle.id]);
+	// A crashed agent frees its limit slot and the name is reusable.
+	const second = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	assert.notEqual(second.id, handle.id);
+});
+
+test("send failure marks the child crashed", async () => {
+	const { supervisor, sessions } = createHarness();
+	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	const session = sessions[0] as FakeRpcSession;
+	session.failNext = new Error("Agent process stdin is not writable");
+	assert.equal(await supervisor.prompt(handle.id, "hello"), false);
+	assert.equal(supervisor.list()[0]?.state, "crashed");
+});
+
+test("factory failure throws a clear error and emits terminal events", async () => {
 	const { supervisor } = createHarness();
-	assert.equal(supervisor.steer("any", "text"), "not-implemented");
+	const failing = async () => {
+		throw new Error("spawn ENOENT");
+	};
+	const patched = supervisor as unknown as { sessionFactory: unknown };
+	patched.sessionFactory = failing;
+	const events: string[] = [];
+	supervisor.onEvent((event) => events.push(event.type));
+	await assert.rejects(() => supervisor.spawn({ name: "bad", cwd: "/tmp" }), /Failed to start rpc child/);
+	assert.ok(events.includes("agent-final"), "terminal event emitted for the failed spawn");
 });
 
-test("raw event lines are mirrored verbatim to events.jsonl", async () => {
-	const { supervisor, procs } = createHarness();
-	const handle = supervisor.spawn({ name: "alpha", prompt: "x", cwd: "/tmp" });
-	const proc = procs[0] as FakeProc;
-	const rawLine = sessionLine();
-	proc.emit(rawLine);
-	await waitFor(() => supervisor.tail(handle.id, 10).length >= 0 && rawLine.length > 0, 1000, "emit");
-	const { readFileSync } = await import("node:fs");
-	await waitFor(() => {
-		try {
-			return readFileSync(handle.eventsFile, "utf-8").includes(rawLine);
-		} catch {
-			return false;
-		}
-	}, 2000, "events file flush");
+test("limit defaults to 4 live children and frees slots on archive", async () => {
+	const { supervisor } = createHarness();
+	const ids = [];
+	for (const name of ["a", "b", "c", "d"]) {
+		ids.push((await supervisor.spawn({ name, cwd: "/tmp" })).id);
+	}
+	await assert.rejects(() => supervisor.spawn({ name: "e", cwd: "/tmp" }), /limit reached/);
+	await supervisor.archive(ids[0] as string);
+	const fifth = await supervisor.spawn({ name: "e", cwd: "/tmp" });
+	assert.ok(fifth.id);
 });
 
-test("stop on unknown or finished child returns false", async () => {
-	const { supervisor, procs } = createHarness();
-	assert.equal(supervisor.stop("missing"), false);
-	const handle = supervisor.spawn({ name: "a", prompt: "x", cwd: "/tmp" });
-	(procs[0] as FakeProc).exit(0);
-	await waitFor(() => (supervisor.list()[0]?.endedAt ?? 0) > 0, 1000, "terminal");
-	assert.equal(supervisor.stop(handle.id), false);
+test("duplicate live name rejected; reusable after archive", async () => {
+	const { supervisor } = createHarness();
+	const first = await supervisor.spawn({ name: "dup", cwd: "/tmp" });
+	await assert.rejects(() => supervisor.spawn({ name: "dup", cwd: "/tmp" }), /already exists/);
+	await supervisor.archive(first.id);
+	const second = await supervisor.spawn({ name: "dup", cwd: "/tmp" });
+	assert.notEqual(second.id, first.id);
+});
+
+test("pin toggles and the pinned flag surfaces in snapshots", async () => {
+	const { supervisor } = createHarness();
+	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	assert.equal(supervisor.pin(handle.id), true);
+	assert.equal(supervisor.list()[0]?.pinned, true);
+	supervisor.pin(handle.id, false);
+	assert.equal(supervisor.list()[0]?.pinned, false);
+});
+
+test("dispose stops live sessions and is idempotent", async () => {
+	const { supervisor, sessions } = createHarness();
+	await supervisor.spawn({ name: "a", cwd: "/tmp" });
+	await supervisor.spawn({ name: "b", cwd: "/tmp" });
+	supervisor.dispose();
+	for (const session of sessions) {
+		assert.equal(session.stopCalls, 1);
+	}
+	assert.doesNotThrow(() => supervisor.dispose());
+	await assert.rejects(() => supervisor.spawn({ name: "c", cwd: "/tmp" }), /disposed/);
+});
+
+test("groupOf maps states to the three roster groups", () => {
+	assert.equal(groupOf("working"), "working");
+	assert.equal(groupOf("starting"), "working");
+	assert.equal(groupOf("awaiting-input"), "awaiting-input");
+	assert.equal(groupOf("archived"), "archived");
+	assert.equal(groupOf("crashed"), "archived");
 });

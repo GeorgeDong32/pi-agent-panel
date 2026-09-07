@@ -1,34 +1,46 @@
 /**
  * FleetPanel — thin adapter #1 over FleetSupervisor.
  *
- * Nearly-fullscreen overlay: left roster, right transcript. The render()
- * contract is strict: it reads only cached plain data (supervisor snapshots +
- * tail lines fetched in refresh()) plus the live tui/theme handles handed to
- * the factory — no ctx, no IO, no throws. The stale-ExtensionContext trap
- * (research.md §1.1/§3) is structurally unreachable here.
+ * Fullscreen overlay (100% / margin 0) with an internal list ⇄ view state
+ * machine and a resident composer built on the pi-tui Editor (CJK, paste,
+ * cursor movement for free — probe-verified). The render() contract is
+ * strict: it reads only cached plain data (supervisor snapshots + tail lines
+ * fetched in refresh()) plus the live tui/theme handles handed to the
+ * factory — no ctx, no IO, no throws. The stale-ExtensionContext trap is
+ * structurally unreachable here.
  */
-import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Editor } from "@earendil-works/pi-tui";
+import type { TUI } from "@earendil-works/pi-tui";
 import type { AgentHandle } from "./types.ts";
 import type { FleetSupervisor } from "./supervisor.ts";
 
-type Theme = ExtensionContext["ui"]["theme"];
+type Theme = import("@earendil-works/pi-coding-agent").ExtensionContext["ui"]["theme"];
 /** Panel only styles via fg/bold; accepting the narrower type keeps tests fake-able. */
 type PanelTheme = Pick<Theme, "fg" | "bold">;
 
 const REFRESH_MS = 750;
-const TRANSCRIPT_LINES = 200;
+const TRANSCRIPT_LINES = 400;
+const NEW_TASK_NAME_LIMIT = 24;
 
 function fit(text: string, width: number): string {
 	const clipped = truncateToWidth(text, Math.max(0, width));
 	return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
 }
 
-function statusGlyph(state: AgentHandle["state"], theme: PanelTheme): string {
-	if (state === "running" || state === "starting") return theme.fg("accent", state === "running" ? "●" : "◐");
-	if (state === "completed") return theme.fg("success", "✓");
-	if (state === "stopped") return theme.fg("warning", "■");
-	return theme.fg("error", "✗");
+/** Glyph + color per state (spec §2.1: archived shows ✗, crashed red ✗). */
+function statusGlyph(handle: AgentHandle, theme: PanelTheme): string {
+	switch (handle.state) {
+		case "working":
+			return theme.fg("accent", "●");
+		case "starting":
+			return theme.fg("accent", "◐");
+		case "awaiting-input":
+			return theme.fg("success", "✓");
+		case "archived":
+			return theme.fg("dim", "✗");
+		default:
+			return theme.fg("error", "✗");
+	}
 }
 
 function formatTokens(input: number, output: number): string {
@@ -36,35 +48,83 @@ function formatTokens(input: number, output: number): string {
 	return `${round(input)}↑ ${round(output)}↓`;
 }
 
+function formatRelative(ms: number): string {
+	if (ms < 60_000) return "now";
+	if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m`;
+	if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h`;
+	return `${Math.floor(ms / 86_400_000)}d`;
+}
+
+/** Display name for a new task typed straight into the composer (CJK kept). */
+export function deriveTaskName(task: string): string {
+	const firstLine = task.split("\n").map((l) => l.trim()).find(Boolean) ?? "task";
+	const collapsed = firstLine.replace(/\s+/g, " ");
+	return collapsed.length > NEW_TASK_NAME_LIMIT ? `${collapsed.slice(0, NEW_TASK_NAME_LIMIT)}…` : collapsed;
+}
+
+export interface PanelDeps {
+	/** Working directory + model captured at open time for new tasks. */
+	cwd: string;
+	model?: string;
+	now?: () => number;
+	/** Notification-suppression focus channel shared with the bridge. */
+	focus?: { current: string | null };
+}
+
 export class FleetPanelComponent {
+	private mode: "list" | "view" = "list";
+	private viewId: string | undefined;
 	private items: AgentHandle[] = [];
-	private transcript: string[] = [];
+	private rows: Array<{ handle: AgentHandle; group: string }> = [];
 	private selected = 0;
 	private selectedKey: string | undefined;
+	private transcript: string[] = [];
 	private transcriptAutoFollow = true;
 	private transcriptScroll = 0;
 	private transcriptLineCount = 0;
-	private bodyHeight = 8;
+	private composerActive = false;
+	private composerRole: "new-task" | "reply" = "reply";
+	private statusMessage = "";
 	private disposed = false;
-	/** Stop confirmation: 'x' arms, second 'x' within the same selection fires. */
-	private armedStopKey: string | undefined;
 	private readonly timer: ReturnType<typeof setInterval>;
+	private readonly editor: Editor;
 
 	private readonly tui: { requestRender(force?: boolean): void; terminal?: { rows?: number } };
 	private readonly theme: PanelTheme;
 	private readonly supervisor: FleetSupervisor;
+	private readonly deps: PanelDeps;
 	private readonly done: (result: undefined) => void;
 
 	constructor(
-		tui: { requestRender(force?: boolean): void; terminal?: { rows?: number } },
+		tui: TUI | { requestRender(force?: boolean): void; terminal?: { rows?: number } },
 		theme: PanelTheme,
 		supervisor: FleetSupervisor,
 		done: (result: undefined) => void,
+		deps: PanelDeps,
 	) {
 		this.tui = tui;
 		this.theme = theme;
 		this.supervisor = supervisor;
 		this.done = done;
+		this.deps = deps;
+		// Autocomplete is never wired up, so identity functions suffice for
+		// the select-list theme slice; this keeps the panel pi-tui-only.
+		const identity = (text: string) => text;
+		this.editor = new Editor(
+			tui as TUI,
+			{
+				borderColor: (text: string) => theme.fg("border", text),
+				selectList: {
+					selectedPrefix: identity,
+					selectedText: identity,
+					description: identity,
+					scrollInfo: identity,
+					noMatch: identity,
+				},
+			},
+			{ paddingX: 1 },
+		);
+		this.editor.onSubmit = (text) => this.submitComposer(text);
 		this.refresh();
 		this.timer = setInterval(() => {
 			if (this.disposed) return;
@@ -76,141 +136,393 @@ export class FleetPanelComponent {
 
 	/** All IO and supervisor reads happen here (timer/key context), never in render. */
 	private refresh(): void {
-		const previousKey = this.items[this.selected]?.id ?? this.selectedKey;
 		this.items = this.supervisor.list();
-		const preserved = previousKey ? this.items.findIndex((item) => item.id === previousKey) : -1;
-		this.selected = preserved >= 0 ? preserved : Math.min(this.selected, Math.max(0, this.items.length - 1));
-		this.selectedKey = this.items[this.selected]?.id;
-		const selectedId = this.items[this.selected]?.id;
-		this.transcript = selectedId ? this.supervisor.tail(selectedId, TRANSCRIPT_LINES) : [];
-	}
-
-	private moveSelection(delta: number): void {
-		if (this.items.length === 0) return;
-		this.selected = Math.max(0, Math.min(this.items.length - 1, this.selected + delta));
-		this.selectedKey = this.items[this.selected]?.id;
-		this.transcriptAutoFollow = true;
-		this.armedStopKey = undefined;
-		this.tui.requestRender();
-	}
-
-	private stopSelected(): void {
-		const item = this.items[this.selected];
-		if (!item || item.endedAt) return;
-		if (this.armedStopKey !== item.id) {
-			this.armedStopKey = item.id;
-			this.tui.requestRender();
-			return;
+		if (this.mode === "view") {
+			const handle = this.items.find((item) => item.id === this.viewId);
+			if (!handle) {
+				// Archived-away or otherwise gone: fall back to the list.
+				this.mode = "list";
+				this.viewId = undefined;
+				this.composerActive = false;
+			} else {
+				this.transcript = this.supervisor.tail(handle.id, TRANSCRIPT_LINES);
+			}
 		}
-		this.armedStopKey = undefined;
-		this.supervisor.stop(item.id);
-		this.refresh();
-		this.tui.requestRender();
+		this.rebuildRows();
+		if (this.mode === "list") {
+			const previousKey = this.rows[this.selected]?.handle.id ?? this.selectedKey;
+			const preserved = previousKey ? this.rows.findIndex((row) => row.handle.id === previousKey) : -1;
+			this.selected = preserved >= 0 ? preserved : Math.min(this.selected, Math.max(0, this.rows.length - 1));
+			this.selectedKey = this.rows[this.selected]?.handle.id;
+		}
 	}
+
+	/** Flattened, ordered roster: Pinned first, then Working / Awaiting / Archived. */
+	private rebuildRows(): void {
+		const rows: Array<{ handle: AgentHandle; group: "pinned" | "working" | "awaiting-input" | "archived" }> = [];
+		const pinned = this.items.filter((h) => h.pinned && h.state !== "archived" && h.state !== "crashed");
+		const working = this.items.filter((h) => !h.pinned && (h.state === "working" || h.state === "starting"));
+		const awaiting = this.items.filter((h) => !h.pinned && h.state === "awaiting-input");
+		const archived = this.items.filter((h) => h.state === "archived" || h.state === "crashed");
+		for (const handle of pinned) rows.push({ handle, group: "pinned" });
+		for (const handle of working) rows.push({ handle, group: "working" });
+		for (const handle of awaiting) rows.push({ handle, group: "awaiting-input" });
+		for (const handle of archived) rows.push({ handle, group: "archived" });
+		this.rows = rows;
+	}
+
+	// =========================================================================
+	// Input routing
+	// =========================================================================
 
 	handleInput(data: string): void {
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "q")) {
-			this.done(undefined);
+		if (this.disposed) return;
+		if (this.composerActive) {
+			if (matchesKey(data, "escape")) {
+				this.cancelComposer();
+				return;
+			}
+			this.editor.handleInput(data); // enter submits via editor.onSubmit
 			return;
 		}
-		if (matchesKey(data, "up") || matchesKey(data, "k")) return this.moveSelection(-1);
-		if (matchesKey(data, "down") || matchesKey(data, "j")) return this.moveSelection(1);
-		if (matchesKey(data, "home")) return this.moveSelection(-this.items.length);
-		if (matchesKey(data, "end")) return this.moveSelection(this.items.length);
-		if (matchesKey(data, "enter")) {
-			this.transcriptAutoFollow = true;
+
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || (this.mode === "list" && data === "q")) {
+			if (this.mode === "view") this.backToList();
+			else this.done(undefined);
+			return;
+		}
+		if (this.mode === "view") {
+			this.handleViewInput(data);
+			return;
+		}
+		this.handleListInput(data);
+	}
+
+	private handleListInput(data: string): void {
+		if (matchesKey(data, "up") || data === "k") return this.moveSelection(-1);
+		if (matchesKey(data, "down") || data === "j") return this.moveSelection(1);
+		if (matchesKey(data, "home")) return this.moveSelection(-this.rows.length);
+		if (matchesKey(data, "end")) return this.moveSelection(this.rows.length);
+		if (matchesKey(data, "enter")) return this.openSelected(false);
+		if (data === " ") return this.openSelected(true);
+		if (data === "n") return this.activateComposer("new-task");
+		if (data === "x") return this.abortSelected();
+		if (data === "X" || matchesKey(data, "ctrl+x")) return this.archiveSelected();
+		if (data === "p") {
+			const handle = this.rows[this.selected]?.handle;
+			if (handle) this.supervisor.pin(handle.id);
+			this.refresh();
 			this.tui.requestRender();
 			return;
 		}
+	}
+
+	private handleViewInput(data: string): void {
+		if (matchesKey(data, "left")) return this.backToList();
+		if (matchesKey(data, "up") || data === "k") return this.scrollTranscript(-1);
+		if (matchesKey(data, "down") || data === "j") return this.scrollTranscript(1);
 		if (matchesKey(data, "pageUp")) {
 			this.transcriptAutoFollow = false;
-			this.transcriptScroll = Math.max(0, Math.min(this.transcriptScroll, Math.max(0, this.transcriptLineCount - this.bodyHeight)) - this.bodyHeight);
+			this.transcriptScroll = Math.max(0, this.transcriptScroll - this.viewBodyHeight());
 			this.tui.requestRender();
 			return;
 		}
 		if (matchesKey(data, "pageDown")) {
-			const maxScroll = Math.max(0, this.transcriptLineCount - this.bodyHeight);
-			this.transcriptScroll = Math.min(maxScroll, this.transcriptScroll + this.bodyHeight);
+			const maxScroll = Math.max(0, this.transcriptLineCount - this.viewBodyHeight());
+			this.transcriptScroll = Math.min(maxScroll, this.transcriptScroll + this.viewBodyHeight());
 			this.transcriptAutoFollow = this.transcriptScroll >= maxScroll;
 			this.tui.requestRender();
 			return;
 		}
-		const key = data.toLowerCase();
-		if (key === "x") return this.stopSelected();
-		if (key === "i") {
-			const item = this.items[this.selected];
-			if (item && !item.endedAt) this.supervisor.interrupt(item.id);
+		if (matchesKey(data, "enter") || data === " ") return this.activateComposer("reply");
+		if (data === "x") {
+			if (this.viewId) void this.supervisor.abort(this.viewId);
+			this.statusMessage = "abort sent — agent stays alive";
+			this.tui.requestRender();
 			return;
 		}
-		if (key === "r") {
+		if (data === "R") {
+			this.statusMessage = "revive from session file is planned for a later phase";
+			this.tui.requestRender();
+			return;
+		}
+		// Any other printable character starts composing (type-to-talk).
+		if (data.length > 0 && !isControlSequence(data)) {
+			this.activateComposer("reply");
+			this.editor.handleInput(data);
+		}
+	}
+
+	// =========================================================================
+	// Actions
+	// =========================================================================
+
+	private moveSelection(delta: number): void {
+		if (this.rows.length === 0) return;
+		this.selected = Math.max(0, Math.min(this.rows.length - 1, this.selected + delta));
+		this.selectedKey = this.rows[this.selected]?.handle.id;
+		this.tui.requestRender();
+	}
+
+	private openSelected(focusComposer: boolean): void {
+		const handle = this.rows[this.selected]?.handle;
+		if (!handle) return;
+		this.mode = "view";
+		this.viewId = handle.id;
+		if (this.deps.focus) this.deps.focus.current = handle.id;
+		this.transcriptAutoFollow = true;
+		this.transcriptScroll = 0;
+		this.transcript = [];
+		this.statusMessage = "";
+		if (focusComposer) this.activateComposer("reply");
+		this.refresh();
+		this.tui.requestRender();
+	}
+
+	private backToList(): void {
+		this.mode = "list";
+		this.viewId = undefined;
+		if (this.deps.focus) this.deps.focus.current = null;
+		this.composerActive = false;
+		this.editor.setText("");
+		this.refresh();
+		this.tui.requestRender();
+	}
+
+	private scrollTranscript(delta: number): void {
+		this.transcriptAutoFollow = false;
+		this.transcriptScroll = Math.max(0, this.transcriptScroll + delta);
+		this.tui.requestRender();
+	}
+
+	private activateComposer(role: "new-task" | "reply"): void {
+		const handle = this.mode === "view" ? this.items.find((item) => item.id === this.viewId) : undefined;
+		if (role === "reply" && handle && (handle.state === "crashed" || handle.state === "archived")) {
+			this.statusMessage = "agent is not running — revive (R) is a later-phase feature";
+			this.tui.requestRender();
+			return;
+		}
+		this.composerRole = role;
+		this.composerActive = true;
+		this.editor.focused = true;
+		this.statusMessage = "";
+		this.tui.requestRender();
+	}
+
+	private cancelComposer(): void {
+		this.composerActive = false;
+		this.editor.setText("");
+		this.editor.focused = false;
+		this.tui.requestRender();
+	}
+
+	private submitComposer(text: string): void {
+		const trimmed = text.trim();
+		this.editor.setText("");
+		if (!trimmed) {
+			this.tui.requestRender();
+			return;
+		}
+		if (this.composerRole === "new-task") {
+			this.composerActive = false;
+			this.editor.focused = false;
+			this.statusMessage = "spawning…";
+			this.supervisor
+				.spawn({ name: deriveTaskName(trimmed), cwd: this.deps.cwd, prompt: trimmed, ...(this.deps.model ? { model: this.deps.model } : {}) })
+				.then((handle) => {
+					this.statusMessage = "";
+					this.mode = "view";
+					this.viewId = handle.id;
+					if (this.deps.focus) this.deps.focus.current = handle.id;
+					this.transcriptAutoFollow = true;
+					this.activateComposer("reply");
+					this.refresh();
+					this.tui.requestRender();
+				})
+				.catch((error: unknown) => {
+					this.statusMessage = error instanceof Error ? error.message : String(error);
+					this.refresh();
+					this.tui.requestRender();
+				});
+			this.tui.requestRender();
+			return;
+		}
+		// Reply in view mode: idle → new turn, working → steer (same input box).
+		if (this.viewId) {
+			void this.supervisor.prompt(this.viewId, trimmed, "panel").then((ok) => {
+				if (!ok) this.statusMessage = "send failed — agent no longer running?";
+				this.refresh();
+				this.tui.requestRender();
+			});
+		}
+	}
+
+	private abortSelected(): void {
+		const handle = this.rows[this.selected]?.handle;
+		if (!handle || handle.state !== "working") return;
+		void this.supervisor.abort(handle.id);
+		this.statusMessage = `abort sent to '${handle.name}'`;
+		this.tui.requestRender();
+	}
+
+	private archiveSelected(): void {
+		const handle = this.rows[this.selected]?.handle;
+		if (!handle || handle.state === "archived") return;
+		void this.supervisor.archive(handle.id).then(() => {
 			this.refresh();
 			this.tui.requestRender();
-		}
-	}
-
-	private rosterLines(width: number): string[] {
-		if (this.items.length === 0) {
-			return [this.theme.fg("dim", "No agents — spawn via /agent-panel spawn <name> <prompt>")];
-		}
-		const start = Math.max(0, Math.min(this.selected - this.bodyHeight + 1, Math.max(0, this.items.length - this.bodyHeight)));
-		return this.items.slice(start, start + this.bodyHeight).map((item, offset) => {
-			const index = start + offset;
-			const marker = index === this.selected ? this.theme.fg("accent", "›") : " ";
-			const preview = item.lastLine ? ` ${this.theme.fg("dim", truncateToWidth(item.lastLine, Math.max(0, width - visibleWidth(item.name) - 14)))}` : "";
-			const left = `${marker} ${statusGlyph(item.state, this.theme)} ${item.name}${preview}`;
-			return `${fit(truncateToWidth(left, width - 10), Math.max(0, width - 10))}${fit(this.theme.fg("dim", formatTokens(item.tokens.input, item.tokens.output)), 10)}`;
 		});
+		this.statusMessage = `archiving '${handle.name}' (session file kept)`;
+		this.tui.requestRender();
 	}
 
-	private wrappedTranscript(width: number): string[] {
-		const lines: string[] = [];
-		for (const line of this.transcript) {
-			const wrapped = wrapTextWithAnsi(line, Math.max(1, width));
-			lines.push(...(wrapped.length ? wrapped : [""]));
-		}
-		if (lines.length === 0) lines.push(this.theme.fg("dim", "(waiting for child output…)"));
-		return lines;
+	// =========================================================================
+	// Rendering
+	// =========================================================================
+
+	private viewBodyHeight(): number {
+		// Refreshed during render; callers clamp before use.
+		return Math.max(1, this.transcriptWindowHeight ?? 10);
 	}
+	private transcriptWindowHeight = 10;
 
 	render(width: number): string[] {
 		if (width < 36) return [truncateToWidth("agent-panel needs at least 36 columns. Esc closes.", width)];
 		const innerWidth = width - 2;
-		const rows = this.tui.terminal?.rows ?? 32;
-		this.bodyHeight = Math.max(2, Math.min(30, Math.floor(rows * 0.85) - 6));
-		const rosterWidth = Math.max(22, Math.min(46, Math.floor((innerWidth - 1) * 0.38)));
-		const transcriptWidth = Math.max(1, innerWidth - rosterWidth - 1);
-		const roster = this.rosterLines(rosterWidth);
-		const details = this.wrappedTranscript(transcriptWidth);
-		this.transcriptLineCount = details.length;
-		const maxScroll = Math.max(0, details.length - this.bodyHeight);
-		if (this.transcriptAutoFollow) this.transcriptScroll = maxScroll;
-		else if (this.transcriptScroll > maxScroll) this.transcriptScroll = maxScroll;
-		const visible = details.slice(this.transcriptScroll, this.transcriptScroll + this.bodyHeight);
+		const rows = this.tui.terminal?.rows ?? 24;
+		const editorLines = this.editor.render(innerWidth);
 
-		const live = this.items.filter((item) => !item.endedAt).length;
-		const header = ` ${this.theme.bold("agent-panel")} ${this.theme.fg("dim", `· ${live} live · ${this.items.length} total`)}`;
-		const lines = [this.theme.fg("border", `╭${"─".repeat(innerWidth)}╮`)];
-		lines.push(this.theme.fg("border", "│") + fit(header, innerWidth) + this.theme.fg("border", "│"));
-		lines.push(this.theme.fg("border", `├${"─".repeat(rosterWidth)}┬${"─".repeat(transcriptWidth)}┤`));
-		for (let index = 0; index < this.bodyHeight; index++) {
-			lines.push(
-				this.theme.fg("border", "│")
-				+ fit(roster[index] ?? "", rosterWidth)
-				+ this.theme.fg("border", "│")
-				+ fit(visible[index] ?? "", transcriptWidth)
-				+ this.theme.fg("border", "│"),
-			);
+		const lines: string[] = [];
+		lines.push(this.theme.fg("border", `╭${"─".repeat(innerWidth)}╮`));
+		lines.push(this.theme.fg("border", "│") + fit(this.headerLine(), innerWidth) + this.theme.fg("border", "│"));
+
+		const reserved = 2 /* top+bottom border */ + 1 /* header */ + 1 /* sep */ + editorLines.length + 1 /* sep */ + 1 /* footer */;
+		const bodyHeight = Math.max(1, rows - reserved);
+		const body = this.mode === "view" ? this.viewBody(innerWidth, bodyHeight) : this.listBody(innerWidth, bodyHeight);
+
+		for (const line of body) {
+			lines.push(this.theme.fg("border", "│") + fit(line, innerWidth) + this.theme.fg("border", "│"));
 		}
-		lines.push(this.theme.fg("border", `├${"─".repeat(rosterWidth)}┴${"─".repeat(transcriptWidth)}┤`));
-		const item = this.items[this.selected];
-		const stopHint = item && !item.endedAt
-			? (this.armedStopKey === item.id ? this.theme.fg("error", "x! confirm-stop") : "x stop")
-			: "";
-		const position = this.items.length ? `${this.selected + 1}/${this.items.length}` : "0/0";
-		const footer = ` jk select · enter follow · PgUp/PgDn scroll · i interrupt · ${stopHint} · r refresh · Esc close · ${position}`;
-		lines.push(this.theme.fg("border", "│") + fit(this.theme.fg("dim", footer), innerWidth) + this.theme.fg("border", "│"));
+
+		lines.push(this.theme.fg("border", `├${"─".repeat(innerWidth)}┤`));
+		for (const line of editorLines) {
+			lines.push(this.theme.fg("border", "│") + line + this.theme.fg("border", "│"));
+		}
+		lines.push(this.theme.fg("border", `├${"─".repeat(innerWidth)}┤`));
+		lines.push(this.theme.fg("border", "│") + fit(this.theme.fg("dim", this.footerLine()), innerWidth) + this.theme.fg("border", "│"));
 		lines.push(this.theme.fg("border", `╰${"─".repeat(innerWidth)}╯`));
 		return lines.map((line) => truncateToWidth(line, width));
+	}
+
+	private headerLine(): string {
+		const working = this.items.filter((h) => h.state === "working" || h.state === "starting").length;
+		const awaiting = this.items.filter((h) => h.state === "awaiting-input").length;
+		const archived = this.items.filter((h) => h.state === "archived" || h.state === "crashed").length;
+		const counts = this.theme.fg("dim", `· ${working} working · ${awaiting} awaiting input · ${archived} archived`);
+		if (this.mode === "view") {
+			const handle = this.items.find((item) => item.id === this.viewId);
+			if (handle) {
+				const detail = [
+					handle.state,
+					formatTokens(handle.tokens.input, handle.tokens.output),
+					`${handle.toolCount} tools`,
+					`turn ${handle.turnCount}`,
+					handle.pendingCount > 0 ? `${handle.pendingCount} queued` : "",
+				].filter(Boolean).join(" · ");
+				return ` ${this.theme.bold("agent-panel")} ${statusGlyph(handle, this.theme)} ${this.theme.bold(handle.name)} ${this.theme.fg("dim", detail)}`;
+			}
+		}
+		return ` ${this.theme.bold("agent-panel")} ${counts}`;
+	}
+
+	private listBody(width: number, height: number): string[] {
+		if (this.rows.length === 0) {
+			return [
+				this.theme.fg("dim", "No agents — press n to start a new task, or /agent-panel spawn <name> <prompt>"),
+			];
+		}
+		const start = Math.max(0, Math.min(this.selected - height + 1, Math.max(0, this.rows.length - height)));
+		const window = this.rows.slice(start, start + height);
+		const lines: string[] = [];
+		let lastGroup = "";
+		for (let offset = 0; offset < window.length; offset++) {
+			const row = window[offset];
+			if (!row) break;
+			if (row.group !== lastGroup) {
+				lastGroup = row.group;
+				lines.push(this.groupLabel(row.group));
+			}
+			lines.push(this.rosterLine(row.handle, start + offset === this.selected, width));
+		}
+		return lines;
+	}
+
+	private groupLabel(group: string): string {
+		const labels: Record<string, string> = {
+			pinned: "Pinned",
+			working: "Working",
+			"awaiting-input": "Awaiting input",
+			// Crashed agents land here too, marked by a red glyph (spec §2.1).
+			archived: "Archived",
+		};
+		return this.theme.fg("dim", labels[group] ?? group);
+	}
+
+	private rosterLine(handle: AgentHandle, isSelected: boolean, width: number): string {
+		const marker = isSelected ? this.theme.fg("accent", "›") : " ";
+		const right = this.theme.fg(
+			"dim",
+			`#${handle.id.slice(-4)} ${formatRelative(Math.max(0, (this.deps.now ?? Date.now)() - handle.lastActivityAt))}`,
+		);
+		const rightWidth = visibleWidth(`#abcd 99d`) + 2;
+		const leftWidth = Math.max(1, width - rightWidth);
+		let left = `${marker} ${statusGlyph(handle, this.theme)} ${handle.name}`;
+		if (handle.state === "working" || handle.state === "awaiting-input") {
+			left += this.theme.fg("dim", ` ${formatTokens(handle.tokens.input, handle.tokens.output)}`);
+		}
+		const previewWidth = leftWidth - visibleWidth(left) - 1;
+		if (handle.lastLine && previewWidth > 4) {
+			left += this.theme.fg("dim", ` ${truncateToWidth(handle.lastLine, previewWidth)}`);
+		}
+		return `${truncateToWidth(left, leftWidth)}${" ".repeat(Math.max(0, leftWidth - visibleWidth(left)))}${right}`;
+	}
+
+	private viewBody(width: number, height: number): string[] {
+		const handle = this.items.find((item) => item.id === this.viewId);
+		const lines: string[] = [];
+		if (handle && (handle.state === "crashed" || handle.state === "archived")) {
+			lines.push(this.theme.fg("error", `agent ${handle.state === "crashed" ? "crashed" : "archived"} — composer disabled, session file: ${handle.sessionFile}`));
+		}
+		if (this.statusMessage) lines.push(this.theme.fg("warning", this.statusMessage));
+		const detailLines: string[] = [];
+		for (const line of this.transcript) {
+			const wrapped = wrapTextWithAnsi(line, Math.max(1, width));
+			detailLines.push(...(wrapped.length ? wrapped : [""]));
+		}
+		if (detailLines.length === 0) {
+			detailLines.push(this.theme.fg("dim", handle?.state === "starting" ? "(starting rpc child…)" : "(no output yet — send the first message)"));
+		}
+		this.transcriptLineCount = detailLines.length;
+		this.transcriptWindowHeight = Math.max(1, height - lines.length);
+		const maxScroll = Math.max(0, detailLines.length - this.transcriptWindowHeight);
+		if (this.transcriptAutoFollow) this.transcriptScroll = maxScroll;
+		else if (this.transcriptScroll > maxScroll) this.transcriptScroll = maxScroll;
+		const visible = detailLines.slice(this.transcriptScroll, this.transcriptScroll + this.transcriptWindowHeight);
+		lines.push(...visible);
+		while (lines.length < height) lines.push("");
+		return lines.slice(0, height);
+	}
+
+	private footerLine(): string {
+		if (this.composerActive) {
+			return this.composerRole === "new-task"
+				? "new task: enter spawn+open · esc cancel"
+				: "enter send · esc cancel composer · (agent working → sends as steer)";
+		}
+		if (this.mode === "view") {
+			return "enter/space reply · jk scroll · PgUp/PgDn page · x abort turn · ←/esc back to list";
+		}
+		return "jk select · enter open · space reply · n new task · x abort · X archive · p pin · esc close";
 	}
 
 	invalidate(): void {
@@ -219,19 +531,38 @@ export class FleetPanelComponent {
 
 	dispose(): void {
 		this.disposed = true;
+		if (this.deps.focus) this.deps.focus.current = null;
 		clearInterval(this.timer);
 	}
 }
 
+/** Escape/CSI sequences and control bytes never seed the type-to-talk path. */
+function isControlSequence(data: string): boolean {
+	return data.charCodeAt(0) === 0x1b || data.charCodeAt(0) < 0x20 || data.charCodeAt(0) === 0x7f;
+}
+
 export async function openFleetPanel(
-	ctx: ExtensionContext,
+	ctx: import("@earendil-works/pi-coding-agent").ExtensionContext,
 	supervisor: FleetSupervisor,
+	focus: { current: string | null },
+	deps: { cwd?: string; model?: string } = {},
 ): Promise<void> {
+	// Model forwarding (proposal §4.5): the child starts on whatever the main
+	// session currently uses; one-shot at spawn, later switches are the child's own.
+	const model = ctx.model?.id ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 	await ctx.ui.custom<undefined>(
-		(tui, theme, _keybindings, done) => new FleetPanelComponent(tui, theme, supervisor, done),
+		(tui, theme, _keybindings, done) =>
+			new FleetPanelComponent(tui, theme, supervisor, done, {
+				cwd: deps.cwd ?? ctx.cwd,
+				model: deps.model ?? model,
+				focus,
+			}),
 		{
 			overlay: true,
-			overlayOptions: { anchor: "center", width: "95%", minWidth: 60, maxHeight: "85%", margin: 1 },
+			// Fullscreen: cover the whole terminal including the pi dock.
+			overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 },
 		},
 	);
+	// Panel closed: nothing is being viewed anymore.
+	focus.current = null;
 }

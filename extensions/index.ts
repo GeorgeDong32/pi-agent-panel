@@ -8,16 +8,17 @@
  * (pattern proven in pi-subagents, research.md §1.1).
  *
  * Commands:
- *   /agent-panel                    — open/close the fleet overlay
- *   /agent-panel spawn <name> <prompt...> — spawn a headless child
- *   /agent-panel stop <name|id>     — stop a live child
+ *   /agent-panel                        — open/close the fullscreen fleet panel
+ *   /agent-panel spawn <name> <prompt...> — start a background task
+ *   /agent-panel archive <name|id>      — archive (kill + hide, JSONL kept)
+ *   /agent-panel stop <name|id>         — alias of archive (v0.1 compat)
  * Shortcut: alt+p toggles the panel.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CHILD_ENV } from "./lib/pi-spawn.ts";
 import { FleetSupervisor } from "./lib/supervisor.ts";
 import { openFleetPanel } from "./lib/panel.ts";
-import { createNotificationBridge } from "./lib/bridge.ts";
+import { createNotificationBridge, type PanelFocus } from "./lib/bridge.ts";
 import { createStatusPill } from "./lib/pill.ts";
 
 const GLOBAL_CLEANUP_KEY = "__piAgentPanelRuntimeCleanup";
@@ -26,7 +27,10 @@ interface Runtime {
 	supervisor: FleetSupervisor;
 	bridge: { dispose: () => void };
 	pill: { update: (ctx: ExtensionContext) => void; dispose: (ctx: ExtensionContext | null) => void };
+	/** Shared view-focus channel: panel writes, bridge reads (suppression). */
+	focus: PanelFocus;
 	lastCtx: ExtensionContext | null;
+	unsubscribePillEvents: () => void;
 }
 
 export default function registerAgentPanel(pi: ExtensionAPI): void {
@@ -50,6 +54,7 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 		if (!runtime) return;
 		const current = runtime;
 		runtime = null;
+		current.unsubscribePillEvents();
 		current.bridge.dispose();
 		current.pill.dispose(current.lastCtx);
 		current.supervisor.dispose();
@@ -66,7 +71,7 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 	};
 
 	pi.registerCommand("agent-panel", {
-		description: "Fleet panel: manage headless child pi sessions",
+		description: "Fleet panel: fullscreen manager for background pi agent sessions",
 		handler: async (args: string, ctx: ExtensionContext) => {
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			if (parts[0] === "spawn") {
@@ -76,40 +81,46 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 					return;
 				}
 				const prompt = args.trim().split(/\s+/).slice(2).join(" ");
+				const model = ctx.model?.id ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 				try {
-					const handle = ensureRuntime().supervisor.spawn({ name, prompt, cwd: ctx.cwd });
-					ctx.ui.notify(`agent-panel: spawned '${handle.name}' (${handle.id})`, "info");
+					const handle = await ensureRuntime().supervisor.spawn({
+						name,
+						cwd: ctx.cwd,
+						prompt,
+						...(model ? { model } : {}),
+					});
+					ctx.ui.notify(`agent-panel: started '${handle.name}' (${handle.id}) — turn ends quietly notify you`, "info");
 				} catch (error) {
 					ctx.ui.notify(`agent-panel: ${error instanceof Error ? error.message : String(error)}`, "error");
 				}
 				return;
 			}
-			if (parts[0] === "stop") {
+			if (parts[0] === "archive" || parts[0] === "stop") {
 				const target = parts[1];
 				if (!target) {
-					ctx.ui.notify("Usage: /agent-panel stop <name|id>", "warning");
+					ctx.ui.notify("Usage: /agent-panel archive <name|id>", "warning");
 					return;
 				}
 				const supervisor = ensureRuntime().supervisor;
 				const item = supervisor.list().find(
-					(handle) => (handle.id === target || handle.name === target) && handle.endedAt === undefined,
+					(handle) => handle.id === target || handle.name === target,
 				);
-				if (!item) {
+				if (!item || item.state === "archived") {
 					ctx.ui.notify(`agent-panel: no live agent matches '${target}'`, "warning");
 					return;
 				}
-				supervisor.stop(item.id);
-				ctx.ui.notify(`agent-panel: stopping '${item.name}'`, "info");
+				await supervisor.archive(item.id);
+				ctx.ui.notify(`agent-panel: archived '${item.name}' (session file kept: ${item.sessionFile})`, "info");
 				return;
 			}
 			if (args.trim()) {
-				ctx.ui.notify("Usage: /agent-panel [spawn <name> <prompt...> | stop <name|id>]", "warning");
+				ctx.ui.notify("Usage: /agent-panel [spawn <name> <prompt...> | archive <name|id>]", "warning");
 				return;
 			}
 			if (panelOpen) return;
 			panelOpen = true;
 			try {
-				await openFleetPanel(ctx, ensureRuntime().supervisor);
+				await openFleetPanel(ctx, ensureRuntime().supervisor, ensureRuntime().focus);
 			} finally {
 				panelOpen = false;
 			}
@@ -122,7 +133,7 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 			if (panelOpen) return;
 			panelOpen = true;
 			try {
-				await openFleetPanel(ctx, ensureRuntime().supervisor);
+				await openFleetPanel(ctx, ensureRuntime().supervisor, ensureRuntime().focus);
 			} catch {
 				// e.g. runtime missing in odd modes; the command path reports details.
 			} finally {
@@ -134,11 +145,17 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
 		if (runtime) return; // idempotent across reload re-fires
 		const supervisor = new FleetSupervisor();
-		const bridge = createNotificationBridge(pi, supervisor);
+		const focus: PanelFocus = { current: null };
+		const bridge = createNotificationBridge(pi, supervisor, { focus });
 		const pill = createStatusPill(pi, supervisor);
-		runtime = { supervisor, bridge, pill, lastCtx: ctx.hasUI ? ctx : null };
+		runtime = { supervisor, bridge, pill, focus, lastCtx: ctx.hasUI ? ctx : null, unsubscribePillEvents: () => {} };
 		rememberCtx(ctx);
 		pill.update(ctx);
+		// Pill freshness on child activity, not just main-session tool results.
+		runtime.unsubscribePillEvents = supervisor.onEvent(() => {
+			if (!runtime) return;
+			runtime.pill.update(runtime.lastCtx ?? ctx);
+		});
 	});
 
 	pi.on("session_shutdown", () => {

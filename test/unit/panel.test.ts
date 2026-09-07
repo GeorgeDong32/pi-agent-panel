@@ -1,16 +1,14 @@
 /**
- * FleetPanel tests with a fake theme/tui: pin the render structure (roster,
- * transcript pane, footer) and key handling (navigation, armed stop, close)
- * without a real terminal.
+ * FleetPanel tests: real Editor composer against a stub tui/theme, fake
+ * supervisor sessions via the shared harness. Pins the list⇄view state
+ * machine, key routing and the composer pipeline without a terminal.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import test from "node:test";
 import { FleetPanelComponent } from "../../extensions/lib/panel.ts";
-import { FleetSupervisor } from "../../extensions/lib/supervisor.ts";
-import type { ProcessRunner } from "../../extensions/lib/types.ts";
+import { createHarness, emitTurn, type FakeRpcSession } from "./fake-rpc.ts";
+import type { AgentHandle } from "../../extensions/lib/types.ts";
+import type { TUI } from "@earendil-works/pi-tui";
 
 const fakeTheme = {
 	fg: (_name: string, text: string) => text,
@@ -18,110 +16,44 @@ const fakeTheme = {
 };
 
 function createPanelHarness() {
-	const spawns: Array<{ emit: (line: string) => void; exit: (code: number) => void }> = [];
-	const runner: ProcessRunner = {
-		spawn: () => {
-			const queue: string[] = [];
-			const waiters: Array<() => void> = [];
-			let closed = false;
-			const proc = {
-				pid: 42,
-				signals: [] as string[],
-				emit: (line: string) => {
-					queue.push(line);
-					for (const wake of waiters.splice(0)) wake();
-				},
-				exit: (code: number) => {
-					closed = true;
-					exitCode = code;
-					for (const wake of waiters.splice(0)) wake();
-				},
-			};
-			let exitCode: number | undefined;
-			spawns.push(proc);
-			return {
-				pid: 42,
-				kill: (signal?: NodeJS.Signals) => {
-					proc.signals.push(signal ?? "SIGTERM");
-				},
-				exited: new Promise<number>((resolve) => {
-					const poll = setInterval(() => {
-						if (exitCode !== undefined) {
-							clearInterval(poll);
-							resolve(exitCode);
-						}
-					}, 5);
-					// Keep test exits from waiting on never-exited fakes.
-					poll.unref();
-				}),
-				stdout: (async function* () {
-					let index = 0;
-					for (;;) {
-						while (index < queue.length) {
-							yield queue[index] as string;
-							index += 1;
-						}
-						if (closed && index >= queue.length) return;
-						await new Promise<void>((resolve) => {
-							waiters.push(resolve);
-						});
-					}
-				})(),
-			};
-		},
-	};
-	const supervisor = new FleetSupervisor({
-		runner,
-		rootDir: mkdtempSync(path.join(tmpdir(), "agent-panel-panel-test-")),
-		drainMs: 20,
-		stopGraceMs: 50,
-	});
+	const { supervisor, sessions } = createHarness();
 	const renders: number[] = [];
+	const focus = { current: null as string | null };
 	let doneCalled = false;
 	const panel = new FleetPanelComponent(
-		{ requestRender: () => { renders.push(1); }, terminal: { rows: 30 } },
+		{ requestRender: () => renders.push(1), terminal: { rows: 30 } } as unknown as TUI,
 		fakeTheme,
 		supervisor,
-		(_result) => {
+		() => {
 			doneCalled = true;
 		},
+		{ cwd: "/tmp", focus },
 	);
-	return { panel, supervisor, spawns, isDone: () => doneCalled, renderCount: () => renders.length };
+	return { panel, supervisor, sessions, focus, isDone: () => doneCalled, renderCount: () => renders.length };
+}
+
+async function spawnAgent(h: ReturnType<typeof createPanelHarness>, name: string): Promise<{ handle: AgentHandle; session: FakeRpcSession }> {
+	const handle = await h.supervisor.spawn({ name, cwd: "/tmp" });
+	const session = h.sessions[h.sessions.length - 1] as FakeRpcSession;
+	return { handle, session };
 }
 
 const WIDTH = 100;
 
-test("empty roster renders guidance and footer", () => {
+test("empty roster renders guidance, groups header and footer hints", () => {
 	const { panel } = createPanelHarness();
-	const lines = panel.render(WIDTH);
-	const text = lines.join("\n");
+	const text = panel.render(WIDTH).join("\n");
 	assert.ok(text.includes("agent-panel"), "header present");
 	assert.ok(text.includes("No agents"), "empty-roster guidance present");
-	assert.ok(text.includes("Esc close"), "footer hints present");
-});
-
-test("roster shows agent name and status; transcript pane mirrors tail", async () => {
-	const { panel, supervisor, spawns } = createPanelHarness();
-	supervisor.spawn({ name: "alpha", prompt: "do the thing", cwd: "/tmp" });
-	const child = spawns[0] as { emit: (line: string) => void };
-	child.emit(JSON.stringify({ type: "session", version: 3 }));
-	child.emit(JSON.stringify({
-		type: "message_end",
-		message: { role: "assistant", content: [{ type: "text", text: "thinking hard" }], stopReason: "stop" },
-	}));
-	await new Promise((resolve) => setTimeout(resolve, 50));
-	panel.invalidate();
-	const text = panel.render(WIDTH).join("\n");
-	assert.ok(text.includes("alpha"), "roster shows name");
-	assert.ok(text.includes("1/1"), "position indicator");
-	assert.ok(text.includes("thinking hard") || text.includes("waiting for child output"), "transcript content");
+	assert.ok(text.includes("n new task"), "footer hints present");
+	assert.ok(text.includes("esc close"), "esc hint present");
 });
 
 test("narrow width degrades to a single hint line", () => {
 	const { panel } = createPanelHarness();
 	const lines = panel.render(30);
 	assert.equal(lines.length, 1);
-	assert.ok(lines[0]?.includes("agent-panel"), "hint mentions the panel");
+	assert.ok(lines[0]?.includes("agent-panel"));
 });
 
 test("q/escape close the panel via done()", () => {
@@ -129,27 +61,167 @@ test("q/escape close the panel via done()", () => {
 	assert.equal(isDone(), false);
 	panel.handleInput("q");
 	assert.equal(isDone(), true);
+	const { panel: panel2, isDone: isDone2 } = createPanelHarness();
+	panel2.handleInput("\x1b");
+	assert.equal(isDone2(), true);
 });
 
-test("j/k move the selection; x arms then confirms stop", async () => {
-	const { panel, supervisor, spawns } = createPanelHarness();
-	supervisor.spawn({ name: "a", prompt: "x", cwd: "/tmp" });
-	supervisor.spawn({ name: "b", prompt: "x", cwd: "/tmp" });
-	const child = spawns[1] as unknown as { emit: (line: string) => void };
-	child.emit(JSON.stringify({ type: "session", version: 3 }));
-	await new Promise((resolve) => setTimeout(resolve, 30));
-	panel.invalidate();
-	const textBefore = panel.render(WIDTH).join("\n");
-	assert.ok(textBefore.includes("1/2"), "starts on first item");
-	panel.handleInput("j");
-	assert.ok(panel.render(WIDTH).join("\n").includes("2/2"), "moved to second");
-	panel.handleInput("x");
-	const armed = panel.render(WIDTH).join("\n");
-	assert.ok(armed.includes("confirm-stop"), "first x arms");
-	panel.handleInput("x");
-	// Fake children only die when told to: simulate the SIGINT taking effect.
-	(spawns[1] as unknown as { exit: (code: number) => void }).exit(130);
+test("roster groups: working/awaiting/archived with live counts in header", async () => {
+	const h = createPanelHarness();
+	await spawnAgent(h, "worker");
+	await spawnAgent(h, "idler");
+	await spawnAgent(h, "gone");
+	const workerSession = h.sessions[0] as FakeRpcSession;
+	workerSession.emit({ type: "agent_start" });
+	await h.supervisor.archive((h.supervisor.list().find((a) => a.name === "gone") as AgentHandle).id);
+	h.panel.invalidate();
+	const text = h.panel.render(WIDTH).join("\n");
+	assert.ok(text.includes("1 working · 1 awaiting input · 1 archived"), "three-segment counts");
+	assert.ok(text.includes("Working"));
+	assert.ok(text.includes("Awaiting input"));
+	assert.ok(text.includes("Archived"));
+	assert.ok(text.includes("worker"));
+	assert.ok(text.includes("idler"));
+});
+
+test("j/k move selection; enter opens view; ← and esc return to list", async () => {
+	const h = createPanelHarness();
+	await spawnAgent(h, "a");
+	await spawnAgent(h, "b");
+	h.panel.invalidate();
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("a"), "roster shows agents");
+	h.panel.handleInput("j");
+	h.panel.handleInput("\r"); // enter → view mode
+	h.panel.invalidate();
+	const viewText = h.panel.render(WIDTH).join("\n");
+	assert.ok(viewText.includes("b"), "view opened for second agent");
+	assert.ok(viewText.includes("back to list"), "view footer");
+	h.panel.handleInput("\x1b[D"); // left arrow
+	h.panel.invalidate();
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("jk select"), "back in list mode");
+	// And again into view, this time leaving via esc.
+	h.panel.handleInput("\r");
+	h.panel.handleInput("\x1b");
+	h.panel.invalidate();
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("jk select"), "esc returns to list from view");
+});
+
+test("view focus channel tracks the viewed agent for suppression", async () => {
+	const h = createPanelHarness();
+	const { handle } = await spawnAgent(h, "a");
+	h.panel.invalidate();
+	h.panel.handleInput("\r");
+	assert.equal(h.focus.current, handle.id);
+	h.panel.handleInput("\x1b[D");
+	assert.equal(h.focus.current, null);
+});
+
+test("composer: n → CJK task → enter spawns with derived name and jumps to view", async () => {
+	const h = createPanelHarness();
+	h.panel.handleInput("n");
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("new task:"), "composer hint");
+	h.panel.handleInput("调"); // CJK codepoint goes through the real Editor
+	h.panel.handleInput("查缓存问题");
+	h.panel.handleInput("\r"); // submit
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(h.supervisor.list().length, 1);
+	const spawned = h.supervisor.list()[0] as AgentHandle;
+	assert.equal(spawned.name, "调查缓存问题");
+	assert.deepEqual((h.sessions[0] as FakeRpcSession).sends.map((s) => s.text), ["调查缓存问题"]);
+	// After spawn the panel jumps into the view with the composer still live.
+	h.panel.invalidate();
+	const text = h.panel.render(WIDTH).join("\n");
+	assert.ok(text.includes("调查缓存问题"), "view header shows new agent");
+	assert.ok(text.includes("enter send"), "reply composer active");
+	assert.equal(h.focus.current, spawned.id);
+});
+
+test("composer reply in view: submit prompts with panel origin; esc cancels draft", async () => {
+	const h = createPanelHarness();
+	const { handle } = await spawnAgent(h, "a");
+	h.panel.invalidate();
+	h.panel.handleInput(" "); // space → view + focus composer
+	h.panel.handleInput("追问一下");
+	h.panel.handleInput("\x1b"); // esc cancels the draft
+	h.panel.invalidate();
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("reply · jk scroll"), "composer cancelled, nav keys back");
+	// Type-to-talk: printable input in view-inactive mode starts composing.
+	h.panel.handleInput("你");
+	h.panel.handleInput("好");
+	h.panel.handleInput("\r");
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	const session = h.sessions[0] as FakeRpcSession;
+	assert.deepEqual(session.sends.map((s) => s.text), ["你好"]);
+	assert.deepEqual(session.sends.map((s) => s.kind), ["prompt"]);
+	assert.ok(h.focus.current === handle.id);
+});
+
+test("composer reply while working auto-steers", async () => {
+	const h = createPanelHarness();
+	const { session } = await spawnAgent(h, "a");
+	session.emit({ type: "agent_start" });
+	h.panel.invalidate();
+	h.panel.handleInput(" ");
+	h.panel.handleInput("改一下方向");
+	h.panel.handleInput("\r");
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.deepEqual((h.sessions[0] as FakeRpcSession).sends[0], { text: "改一下方向", kind: "steer" });
+});
+
+test("x aborts the selected working agent; X archives it", async () => {
+	const h = createPanelHarness();
+	const { handle } = await spawnAgent(h, "busy");
+	const session = h.sessions[0] as FakeRpcSession;
+	session.emit({ type: "agent_start" });
+	h.panel.invalidate();
+	h.panel.handleInput("x");
+	assert.equal(session.aborts, 1);
+	h.panel.handleInput("X");
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(h.supervisor.list()[0]?.state, "archived");
+	assert.equal(session.stopCalls, 1);
+	void handle;
+});
+
+test("p pins the selected agent into the Pinned group", async () => {
+	const h = createPanelHarness();
+	await spawnAgent(h, "a");
+	h.panel.invalidate();
+	h.panel.handleInput("p");
+	h.panel.invalidate();
+	const text = h.panel.render(WIDTH).join("\n");
+	assert.ok(text.includes("Pinned"), "pinned group appears");
+	assert.equal(h.supervisor.list()[0]?.pinned, true);
+});
+
+test("view of a crashed agent: composer refuses with a hint", async () => {
+	const h = createPanelHarness();
+	const { handle } = await spawnAgent(h, "dead");
+	// Simulate crash through the supervisor's public surface.
+	await h.supervisor.archive(handle.id);
+	const crashed = h.supervisor.list().find((a) => a.id === handle.id) as AgentHandle;
+	crashed.state = "crashed";
+	h.panel.invalidate();
+	h.panel.handleInput("\r"); // open view (archived/crashed group row)
+	h.panel.handleInput(" "); // try to focus composer
+	h.panel.invalidate();
+	const text = h.panel.render(WIDTH).join("\n");
+	assert.ok(text.includes("not running"), "composer disabled hint");
+	const session = h.sessions[0] as FakeRpcSession;
+	assert.equal(session.sends.length, 0, "nothing sent to a dead agent");
+});
+
+test("transcript pane mirrors tail output in view mode", async () => {
+	const h = createPanelHarness();
+	const { session, handle } = await spawnAgent(h, "talker");
+	emitTurn(session, "task text", "第一行回答\n第二行回答");
+	// The events mirror flushes asynchronously; wait for it before reading.
 	await new Promise((resolve) => setTimeout(resolve, 60));
-	const stopped = supervisor.list().find((h) => h.name === "b");
-	assert.equal(stopped?.state, "stopped", "second x stops the child");
+	h.panel.invalidate();
+	h.panel.handleInput("\r");
+	h.panel.invalidate();
+	const text = h.panel.render(WIDTH).join("\n");
+	assert.ok(text.includes("▶ task text"), "user line");
+	assert.ok(text.includes("第一行回答"), "assistant line 1");
+	assert.ok(text.includes("第二行回答"), "assistant line 2");
 });

@@ -1,71 +1,63 @@
 /**
  * FleetSupervisor — the deep module of pi-agent-panel.
  *
- * Owns the full child lifecycle: headless spawn (`pi --mode json -p`), JSONL
- * event parsing, state aggregation, terminal-state detection, and event
- * fan-out. Zero TUI code, zero pi-extension API usage; process creation goes
- * through the injected ProcessRunner seam so tests run against fakes.
+ * A pool of long-lived rpc children (`pi --mode rpc`): spawn/prompt/steer/
+ * abort/archive plus state aggregation and event fan-out. Zero TUI code,
+ * zero pi-extension API usage; session creation goes through the injected
+ * RpcSessionFactory seam so unit tests run against scripted fakes.
  *
- * Memory invariant ("disk is the full set, live is a suffix"): per child, only
- * the scalar aggregates in AgentHandle stay resident. Every stdout line is
- * appended to eventsFile; full history lives in the child's own --session
- * JSONL. Panels re-read the tail from disk on demand via tail().
+ * State derivation is event-first (decision D-state): agent_start/agent_end
+ * drive working ⇄ awaiting-input; one getState() after spawn aligns the
+ * initial snapshot. A slow liveness probe (probeMs) exists only to notice a
+ * child that died while idle — RpcClient surfaces no exit callback.
+ *
+ * Memory invariant ("disk is the full set, live is a suffix"): per child,
+ * only the scalar aggregates in AgentHandle stay resident. Every onEvent
+ * object is appended (re-serialized) to eventsFile; full history lives in
+ * the child's own --session JSONL. Panels re-read the tail on demand.
  */
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildChildArgs, getPiSpawnCommand, PROMPT_ARG_LIMIT, CHILD_ENV } from "./pi-spawn.ts";
-import { realRunner } from "./runner.ts";
+import { realRpcSessionFactory } from "./rpc-session.ts";
 import type {
 	AgentHandle,
 	AgentSpec,
 	AgentState,
-	ChildProcessHandle,
-	ProcessRunner,
+	PromptOrigin,
+	RpcAgentEvent,
+	RpcSessionFactory,
+	RpcSession,
+	RpcSessionSnapshot,
 	SupervisorEvent,
 } from "./types.ts";
 
-const DEFAULT_LIMIT = 8;
-const DEFAULT_DRAIN_MS = 500;
-const DEFAULT_STOP_GRACE_MS = 2000;
+/** Long-lived children each hold a full agent runtime: keep the pool small. */
+const DEFAULT_LIMIT = 4;
+const DEFAULT_PROBE_MS = 5000;
 /** Bytes read from the tail of eventsFile per tail() call; ample for maxLines. */
 const TAIL_READ_BYTES = 64 * 1024;
 
 export interface SupervisorDeps {
-	runner?: ProcessRunner;
+	sessionFactory?: RpcSessionFactory;
 	/** Root directory for child artifacts. Default: ~/.pi/agent/agent-panel */
 	rootDir?: string;
 	limit?: number;
 	now?: () => number;
-	/** Grace window after process exit for buffered stdout lines to land. */
-	drainMs?: number;
-	/** SIGINT → SIGKILL escalation window for stop(). */
-	stopGraceMs?: number;
+	/** Idle-liveness probe interval; 0 disables (tests). */
+	probeMs?: number;
 }
 
 interface ChildRecord {
 	handle: AgentHandle;
-	proc: ChildProcessHandle;
+	session: RpcSession;
+	unsubscribeEvents: () => void;
 	eventsStream: fs.WriteStream;
-	outputDone: Promise<void>;
-	stopRequested: boolean;
+	probe: ReturnType<typeof setInterval> | undefined;
+	/** Origin of the in-flight turn (reset to background at turn end). */
+	currentOrigin: PromptOrigin;
 	finalized: boolean;
-	finalEmitted: boolean;
-	graceTimer: NodeJS.Timeout | undefined;
-	finalizeTimer: NodeJS.Timeout | undefined;
-}
-
-interface ParsedEvent {
-	type?: string;
-	message?: {
-		role?: string;
-		content?: Array<{ type?: string; text?: string }>;
-		usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } };
-		stopReason?: string;
-		errorMessage?: string;
-	};
-	toolName?: string;
 }
 
 function sanitizeSegment(value: string): string {
@@ -73,7 +65,7 @@ function sanitizeSegment(value: string): string {
 	return cleaned || "agent";
 }
 
-function assistantText(message: NonNullable<ParsedEvent["message"]>): string {
+function assistantText(message: NonNullable<RpcAgentEvent["message"]>): string {
 	if (!Array.isArray(message.content)) return "";
 	return message.content
 		.filter((part) => part?.type === "text" && typeof part.text === "string")
@@ -81,12 +73,8 @@ function assistantText(message: NonNullable<ParsedEvent["message"]>): string {
 		.join("\n");
 }
 
-function hasToolCall(message: NonNullable<ParsedEvent["message"]>): boolean {
-	return Array.isArray(message.content) && message.content.some((part) => part?.type === "toolCall");
-}
-
-/** JSON event line → human-readable transcript lines; empty = skip. */
-export function formatEventLines(evt: ParsedEvent): string[] {
+/** Event object → human-readable transcript lines; empty = skip. */
+export function formatEventLines(evt: RpcAgentEvent): string[] {
 	if (evt.type === "message_end" && evt.message?.role === "user") {
 		const text = assistantText(evt.message).split("\n").find((line) => line.trim());
 		return text ? [`▶ ${text}`] : [];
@@ -98,38 +86,43 @@ export function formatEventLines(evt: ParsedEvent): string[] {
 	if (evt.type === "tool_execution_start") {
 		return [`⚙ ${evt.toolName ?? "tool"}`];
 	}
+	if (evt.type === "extension_ui_request") {
+		return [`⚠ child ui request denied: ${evt.title ?? evt.method ?? "unknown"}`];
+	}
 	return [];
 }
 
 export class FleetSupervisor {
-	private readonly runner: ProcessRunner;
+	private readonly sessionFactory: RpcSessionFactory;
 	private readonly rootDir: string;
 	private readonly limit: number;
 	private readonly now: () => number;
-	private readonly drainMs: number;
-	private readonly stopGraceMs: number;
+	private readonly probeMs: number;
 	private readonly children = new Map<string, ChildRecord>();
 	private readonly listeners = new Set<(event: SupervisorEvent) => void>();
+	private readonly archivedIds: Set<string>;
 	private disposed = false;
 
 	constructor(deps: SupervisorDeps = {}) {
-		this.runner = deps.runner ?? realRunner;
+		this.sessionFactory = deps.sessionFactory ?? realRpcSessionFactory;
 		this.rootDir = deps.rootDir ?? path.join(os.homedir(), ".pi", "agent", "agent-panel");
 		this.limit = deps.limit ?? DEFAULT_LIMIT;
 		this.now = deps.now ?? Date.now;
-		this.drainMs = deps.drainMs ?? DEFAULT_DRAIN_MS;
-		this.stopGraceMs = deps.stopGraceMs ?? DEFAULT_STOP_GRACE_MS;
+		this.probeMs = deps.probeMs ?? DEFAULT_PROBE_MS;
+		this.archivedIds = this.loadArchivedIds();
 	}
 
-	spawn(spec: AgentSpec): AgentHandle {
+	/** Create a live rpc child. Resolves once the session is started and its
+	 *  initial state aligned; the optional first prompt is sent as background. */
+	async spawn(spec: AgentSpec & { prompt?: string }): Promise<AgentHandle> {
 		if (this.disposed) throw new Error("FleetSupervisor is disposed");
 		if (!spec.name.trim()) throw new Error("Agent name must be non-empty");
-		const liveCount = [...this.children.values()].filter((record) => !record.handle.endedAt).length;
+		const liveCount = [...this.children.values()].filter((record) => isLive(record.handle)).length;
 		if (liveCount >= this.limit) {
 			throw new Error(`Agent limit reached (${this.limit} live children)`);
 		}
 		const nameTaken = [...this.children.values()].some(
-			(record) => record.handle.name === spec.name && !record.handle.endedAt,
+			(record) => record.handle.name === spec.name && isLive(record.handle),
 		);
 		if (nameTaken) throw new Error(`A live agent named '${spec.name}' already exists`);
 
@@ -139,27 +132,8 @@ export class FleetSupervisor {
 			.slice(0, 6)}`;
 		const childDir = path.join(this.rootDir, id);
 		fs.mkdirSync(childDir, { recursive: true });
-
 		const sessionFile = path.join(childDir, "session.jsonl");
 		const eventsFile = path.join(childDir, "events.jsonl");
-		let promptFile: string | undefined;
-		if (spec.prompt.length > PROMPT_ARG_LIMIT) {
-			promptFile = path.join(childDir, "task.md");
-			fs.writeFileSync(promptFile, `Task: ${spec.prompt}`);
-		}
-
-		const args = buildChildArgs({
-			sessionFile,
-			...(spec.model ? { model: spec.model } : {}),
-			...(spec.permissionMode ? { permissionMode: spec.permissionMode } : {}),
-			prompt: spec.prompt,
-			...(promptFile ? { promptFile } : {}),
-		});
-		const spawnSpec = getPiSpawnCommand(args);
-		const proc = this.runner.spawn(spawnSpec.command, spawnSpec.args, {
-			cwd: spec.cwd,
-			env: { ...process.env, [CHILD_ENV]: "1" },
-		});
 
 		const handle: AgentHandle = {
 			id,
@@ -168,52 +142,126 @@ export class FleetSupervisor {
 			startedAt: this.now(),
 			tokens: { input: 0, output: 0, cost: 0 },
 			toolCount: 0,
+			turnCount: 0,
 			sessionFile,
 			eventsFile,
 			lastLine: "",
+			lastActivityAt: this.now(),
+			pendingCount: 0,
+			pinned: false,
 		};
-		const eventsStream = fs.createWriteStream(eventsFile, { flags: "a" });
-		const record: ChildRecord = {
-			handle,
-			proc,
-			eventsStream,
-			outputDone: Promise.resolve(),
-			stopRequested: false,
-			finalized: false,
-			finalEmitted: false,
-			graceTimer: undefined,
-			finalizeTimer: undefined,
-		};
-		this.children.set(id, record);
-		record.outputDone = this.consumeOutput(record);
-		void this.awaitExit(record);
 		this.emit({ type: "agent-added", handle: this.snapshot(handle) });
+
+		let session;
+		try {
+			session = await this.sessionFactory({
+				cwd: spec.cwd,
+				sessionFile,
+				...(spec.model ? { model: spec.model } : {}),
+			});
+		} catch (error) {
+			this.markCrashed(handle, undefined, error instanceof Error ? error.message : String(error));
+			throw new Error(`Failed to start rpc child '${spec.name}': ${error instanceof Error ? error.message : String(error)}`);
+		}
+
+		let record: ChildRecord;
+		try {
+			const recordRef: ChildRecord = {
+				handle,
+				session,
+				unsubscribeEvents: () => {},
+				eventsStream: fs.createWriteStream(eventsFile, { flags: "a" }),
+				probe: undefined,
+				currentOrigin: "background",
+				finalized: false,
+			};
+			record = recordRef;
+			this.children.set(id, recordRef);
+			recordRef.unsubscribeEvents = session.onEvent((event) => this.applyEvent(recordRef, event));
+			recordRef.probe = this.startProbe(recordRef);
+		} catch (error) {
+			void session.stop().catch(() => {});
+			this.markCrashed(handle, undefined, error instanceof Error ? error.message : String(error));
+			throw new Error(`Failed to wire rpc child '${spec.name}': ${error instanceof Error ? error.message : String(error)}`);
+		}
+
+		// One-shot initial alignment (decision D-state): trust events after this.
+		try {
+			const state = await session.getState();
+			this.alignState(record, state);
+		} catch {
+			// Alignment is best-effort; events and the probe cover the rest.
+		}
+		this.emit({ type: "agent-updated", handle: this.snapshot(handle) });
+
+		if (spec.prompt?.trim()) await this.prompt(id, spec.prompt, "background");
 		return this.snapshot(handle);
 	}
 
-	/** D5: seam placeholder so the interface stays stable for phase 2. */
-	steer(_id: string, _text: string): "not-implemented" {
-		return "not-implemented";
+	/**
+	 * Send user text to an agent. Idle → new turn (prompt); working → native
+	 * steer semantics — the same composer input is correct in both phases.
+	 */
+	async prompt(id: string, text: string, origin: PromptOrigin = "background"): Promise<boolean> {
+		const record = this.children.get(id);
+		if (!record || !isLive(record.handle) || !text.trim()) return false;
+		record.currentOrigin = origin;
+		record.handle.lastActivityAt = this.now();
+		try {
+			if (record.handle.state === "working") await record.session.steer(text);
+			else await record.session.prompt(text);
+			return true;
+		} catch {
+			this.markCrashed(record.handle, undefined, "send failed");
+			return false;
+		}
 	}
 
-	/** Send SIGINT for a graceful abort; the child may still complete. */
-	interrupt(id: string): boolean {
+	/** Interrupt the current turn (rpc abort); the agent itself stays alive. */
+	async abort(id: string): Promise<boolean> {
 		const record = this.children.get(id);
-		if (!record || record.handle.endedAt) return false;
-		record.proc.kill("SIGINT");
+		if (!record || !isLive(record.handle)) return false;
+		try {
+			await record.session.abort();
+			record.handle.lastActivityAt = this.now();
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Archive: hide from the live groups, kill the process (SIGTERM→SIGKILL
+	 * inside the client), keep session/events JSONL on disk. The archived set
+	 * is persisted to state.json so the hiding survives restarts (revive is
+	 * phase 2).
+	 */
+	async archive(id: string): Promise<boolean> {
+		const record = this.children.get(id);
+		if (!record || record.handle.state === "archived") return false;
+		this.clearProbe(record);
+		record.unsubscribeEvents();
+		record.handle.state = "archived";
+		record.handle.endedAt = this.now();
+		record.handle.currentTool = undefined;
+		this.archivedIds.add(id);
+		this.persistArchivedIds();
+		record.eventsStream.end();
+		this.emit({ type: "agent-updated", handle: this.snapshot(record.handle) });
+		this.emit({ type: "agent-final", handle: this.snapshot(record.handle) });
+		try {
+			await record.session.stop();
+		} catch {
+			// The kill chain escalates internally; a rejected stop still killed.
+		}
 		return true;
 	}
 
-	/** Request termination: SIGINT, then SIGKILL after the grace window. */
-	stop(id: string): boolean {
+	pin(id: string, pinned?: boolean): boolean {
 		const record = this.children.get(id);
-		if (!record || record.handle.endedAt) return false;
-		record.stopRequested = true;
-		record.proc.kill("SIGINT");
-		record.graceTimer = setTimeout(() => {
-			if (!record.finalized) record.proc.kill("SIGKILL");
-		}, this.stopGraceMs);
-		record.graceTimer.unref?.();
+		if (!record) return false;
+		record.handle.pinned = pinned ?? !record.handle.pinned;
+		this.emit({ type: "agent-updated", handle: this.snapshot(record.handle) });
 		return true;
 	}
 
@@ -246,7 +294,7 @@ export class FleetSupervisor {
 			for (const line of window.split("\n")) {
 				if (!line.trim()) continue;
 				try {
-					lines.push(...formatEventLines(JSON.parse(line) as ParsedEvent));
+					lines.push(...formatEventLines(JSON.parse(line) as RpcAgentEvent));
 				} catch {
 					lines.push(line);
 				}
@@ -264,22 +312,169 @@ export class FleetSupervisor {
 		};
 	}
 
-	/** Kill everything and clear timers. Idempotent; supervisor is dead after. */
+	/** Stop every child and clear timers. Idempotent; supervisor is dead after. */
 	dispose(): void {
 		if (this.disposed) return;
 		this.disposed = true;
 		for (const record of this.children.values()) {
-			this.clearTimers(record);
-			if (!record.handle.endedAt) {
-				try {
-					record.proc.kill("SIGKILL");
-				} catch {
-					// Best effort.
-				}
-			}
+			this.clearProbe(record);
+			record.unsubscribeEvents();
 			record.eventsStream.end();
+			if (isLive(record.handle)) {
+				record.handle.state = "archived";
+				record.handle.endedAt = this.now();
+				void record.session.stop().catch(() => {});
+			}
 		}
 		this.listeners.clear();
+	}
+
+	private applyEvent(record: ChildRecord, evt: RpcAgentEvent): void {
+		const handle = record.handle;
+		if (handle.state === "archived") return;
+		// Mirror first: the disk copy is the full set even if aggregation below
+		// changes nothing visible.
+		try {
+			record.eventsStream.write(`${JSON.stringify(evt)}\n`);
+		} catch {
+			// Mirroring is best-effort; supervision continues.
+		}
+		handle.lastActivityAt = this.now();
+		let changed = true;
+
+		switch (evt.type) {
+			case "agent_start":
+				if (isLive(handle)) handle.state = "working";
+				break;
+			case "agent_end":
+				handle.currentTool = undefined;
+				if (!evt.willRetry && isLive(handle)) {
+					handle.state = "awaiting-input";
+					handle.turnCount += 1;
+					const origin = record.currentOrigin;
+					record.currentOrigin = "background";
+					this.emit({ type: "turn-ended", handle: this.snapshot(handle), origin });
+				}
+				break;
+			case "tool_execution_start":
+				if (typeof evt.toolName === "string") {
+					handle.toolCount += 1;
+					handle.currentTool = evt.toolName;
+				}
+				break;
+			case "tool_execution_end":
+				handle.currentTool = undefined;
+				break;
+			case "message_end":
+				if (evt.message?.role === "assistant") {
+					const usage = evt.message.usage;
+					if (usage) {
+						handle.tokens.input += usage.input ?? 0;
+						handle.tokens.output += usage.output ?? 0;
+						handle.tokens.input += usage.cacheRead ?? 0;
+						handle.tokens.input += usage.cacheWrite ?? 0;
+						handle.tokens.cost += usage.cost?.total ?? 0;
+					}
+					const text = assistantText(evt.message).trim();
+					if (text) {
+						const last = text.split("\n").filter((l) => l.trim()).pop();
+						if (last) handle.lastLine = last;
+					}
+				}
+				break;
+			default:
+				changed = false;
+		}
+
+		if (handle.state === "starting" && typeof evt.type === "string" && evt.type !== "session") {
+			handle.state = "awaiting-input";
+		}
+		if (changed) this.emit({ type: "agent-updated", handle: this.snapshot(handle) });
+	}
+
+	private alignState(record: ChildRecord, state: RpcSessionSnapshot): void {
+		const handle = record.handle;
+		if (handle.state === "starting") handle.state = state.isStreaming ? "working" : "awaiting-input";
+		handle.pendingCount = state.pendingMessageCount ?? handle.pendingCount;
+	}
+
+	/** Idle-death detector: RpcClient exposes no exit callback, so a slow
+	 *  getState() probe is the only crash signal while no command is flying. */
+	private startProbe(record: ChildRecord): ReturnType<typeof setInterval> | undefined {
+		if (this.probeMs <= 0) return undefined;
+		const probe = setInterval(() => {
+			if (record.handle.state === "archived") return;
+			record.session
+				.getState()
+				.then((state) => {
+					if (record.handle.state === "archived") return;
+					record.handle.pendingCount = state.pendingMessageCount ?? record.handle.pendingCount;
+				})
+				.catch(() => {
+					if (!record.finalized && isLive(record.handle)) {
+						this.markCrashed(record.handle, undefined, "liveness probe failed");
+					}
+				});
+		}, this.probeMs);
+		probe.unref?.();
+		return probe;
+	}
+
+	private markCrashed(handle: AgentHandle, exitCode: number | undefined, reason: string): void {
+		const record = this.children.get(handle.id);
+		if (record) {
+			if (record.finalized) return;
+			record.finalized = true;
+			this.clearProbe(record);
+			record.unsubscribeEvents();
+			record.eventsStream.end();
+		}
+		handle.state = "crashed";
+		handle.endedAt = this.now();
+		handle.currentTool = undefined;
+		handle.exitCode = exitCode;
+		if (reason) {
+			try {
+				fs.writeFileSync(path.join(path.dirname(handle.eventsFile), "crash.log"), `${new Date().toISOString()} ${reason}\n`);
+			} catch {
+				// Diagnostics are best-effort.
+			}
+		}
+		this.emit({ type: "agent-updated", handle: this.snapshot(handle) });
+		this.emit({ type: "agent-final", handle: this.snapshot(handle) });
+	}
+
+	private persistArchivedIds(): void {
+		try {
+			fs.mkdirSync(this.rootDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(this.rootDir, "state.json"),
+				`${JSON.stringify({ archivedIds: [...this.archivedIds] }, null, "\t")}\n`,
+			);
+		} catch {
+			// Persistence is best-effort; in-memory state still hides the agent.
+		}
+	}
+
+	private loadArchivedIds(): Set<string> {
+		try {
+			const raw = JSON.parse(
+				fs.readFileSync(path.join(this.rootDir, "state.json"), "utf-8"),
+			) as { archivedIds?: unknown };
+			if (Array.isArray(raw.archivedIds)) {
+				return new Set(raw.archivedIds.filter((value): value is string => typeof value === "string"));
+			}
+		} catch {
+			// Missing/invalid state file starts with an empty set.
+		}
+		return new Set();
+	}
+
+	private clearProbe(record: ChildRecord): void {
+		if (record.probe) {
+			clearInterval(record.probe);
+			record.probe = undefined;
+		}
 	}
 
 	private snapshot(handle: AgentHandle): AgentHandle {
@@ -298,129 +493,14 @@ export class FleetSupervisor {
 			}
 		}
 	}
+}
 
-	private async consumeOutput(record: ChildRecord): Promise<void> {
-		try {
-			for await (const line of record.proc.stdout) {
-				if (!line.trim()) continue;
-				record.eventsStream.write(`${line}\n`);
-				this.applyEvent(record, line);
-			}
-		} catch {
-			// Stream errors surface through the exit path instead.
-		}
-	}
+function isLive(handle: AgentHandle): boolean {
+	return handle.state === "starting" || handle.state === "working" || handle.state === "awaiting-input";
+}
 
-	private applyEvent(record: ChildRecord, line: string): void {
-		let evt: ParsedEvent;
-		try {
-			evt = JSON.parse(line) as ParsedEvent;
-		} catch {
-			return; // Non-JSON stdout lines are tolerated by contract.
-		}
-		const handle = record.handle;
-		let changed = false;
-
-		if (handle.state === "starting" && typeof evt.type === "string") {
-			handle.state = "running";
-			changed = true;
-		}
-
-		if (evt.type === "tool_execution_start" && typeof evt.toolName === "string") {
-			handle.toolCount += 1;
-			handle.currentTool = evt.toolName;
-			changed = true;
-		}
-		if (evt.type === "tool_execution_end" && handle.currentTool !== undefined) {
-			handle.currentTool = undefined;
-			changed = true;
-		}
-
-		if (evt.type === "message_end" && evt.message?.role === "assistant") {
-			const usage = evt.message.usage;
-			if (usage) {
-				handle.tokens.input += usage.input ?? 0;
-				handle.tokens.output += usage.output ?? 0;
-				handle.tokens.input += usage.cacheRead ?? 0;
-				handle.tokens.input += usage.cacheWrite ?? 0;
-				handle.tokens.cost += usage.cost?.total ?? 0;
-			}
-			const text = assistantText(evt.message).trim();
-			if (text) {
-				const last = text.split("\n").filter((l) => l.trim()).pop();
-				if (last) handle.lastLine = last;
-			}
-			changed = true;
-		}
-
-		if (changed && !handle.endedAt) {
-			this.emit({ type: "agent-updated", handle: this.snapshot(handle) });
-		}
-	}
-
-	private async awaitExit(record: ChildRecord): Promise<void> {
-		let exitCode: number;
-		try {
-			exitCode = await record.proc.exited;
-		} catch {
-			exitCode = -1;
-		}
-		// Give buffered stdout lines a bounded window to land before freezing state.
-		await Promise.race([
-			record.outputDone,
-			new Promise<void>((resolve) => {
-				record.finalizeTimer = setTimeout(resolve, this.drainMs);
-				record.finalizeTimer.unref?.();
-			}),
-		]);
-		this.finalize(record, exitCode);
-	}
-
-	private finalize(record: ChildRecord, exitCode: number): void {
-		if (record.finalized) return;
-		record.finalized = true;
-		this.clearTimers(record);
-		const handle = record.handle;
-		handle.exitCode = exitCode;
-		handle.endedAt = this.now();
-		handle.currentTool = undefined;
-		handle.state = this.terminalState(record, exitCode);
-		record.eventsStream.end();
-		this.dumpStderr(record);
-		this.emit({ type: "agent-updated", handle: this.snapshot(handle) });
-		if (!record.finalEmitted) {
-			record.finalEmitted = true;
-			this.emit({ type: "agent-final", handle: this.snapshot(handle) });
-		}
-	}
-
-	/** Persist the child's stderr tail next to its artifacts for debugging. */
-	private dumpStderr(record: ChildRecord): void {
-		try {
-			const tail = record.proc.stderrTail?.();
-			if (tail && tail.trim()) {
-				fs.writeFileSync(path.join(path.dirname(record.handle.eventsFile), "stderr.log"), tail);
-			}
-		} catch {
-			// Diagnostics are best-effort.
-		}
-	}
-
-	private terminalState(record: ChildRecord, exitCode: number): AgentState {
-		if (record.stopRequested) return "stopped";
-		return exitCode === 0 ? "completed" : "failed";
-	}
-
-	private clearTimer(record: ChildRecord, key: "graceTimer" | "finalizeTimer"): void {
-		const timer = record[key];
-		if (timer) {
-			clearTimeout(timer);
-			record[key] = undefined;
-		}
-	}
-
-	private clearTimers(record: ChildRecord): void {
-		this.clearTimer(record, "graceTimer");
-		this.clearTimer(record, "finalizeTimer");
-	}
+export function groupOf(state: AgentState): "working" | "awaiting-input" | "archived" {
+	if (state === "working" || state === "starting") return "working";
+	if (state === "crashed" || state === "archived") return "archived";
+	return "awaiting-input";
 }

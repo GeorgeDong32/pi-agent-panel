@@ -19,20 +19,22 @@
 
 > 格式：候选方案（含未选者）→ 放弃了什么 → 风险由谁承担。D1-D4 来自 handoff；D5-D7 为调研中新增的必须决策项。每条决策的证据见 research.md 对应节。
 
-### D1 child 形态与依赖策略 — 选：自研 subprocess spawn 管线
+### D1 child 形态与依赖策略 — 选：自研 subprocess spawn 管线（**v0.2.0 修订：长驻 rpc child 经宿主 RpcClient**）
+
+> **v0.2.0 修订（proposal-v2.md r3，用户 2026-09-08 拍板）**：v1 的「一次性 `--mode json -p`」形态被否——跳转后的体验到不了「像正常对话」。v2 起 child = 长驻 `pi --mode rpc`，经宿主包 `RpcClient`（`@earendil-works/pi-coding-agent` 运行时值导入）驱动。这不是引入外部依赖：扩展运行在 pi 进程内，宿主包就是 pi 本身，版本永远与运行中 CLI 一致（pi-claude-code-tui 同款模式生产实证）。备选（照协议自实现 JSONL 收发 ~150 行）保留为 RpcClient 失配时的 fallback，不并行做。事件流仍是 `JsonAgentSessionEvent`（与 `--mode json` 同族），contract test 的 CLI-face 稳定性论证不变。
 
 **候选方案：**
 
 1. 复用 pi-subagents RPC 桥（`subagents:rpc:v1:*` 事件）。
 2. in-process AgentSession（tintinweb / lite 路线：`createAgentSession` + `session.steer/abort/subscribe`）。
-3. **自研轻量 spawn 管线**（`pi --mode json -p --session <fresh>`，抄 pi-args 模式但只保留 v1 需要的 flag）✅
+3. **自研轻量 spawn 管线**（`pi --mode json -p --session <fresh>`，抄 pi-args 模式但只保留 v1 需要的 flag）✅（v0.1.0；v0.2.0 起升级为长驻 rpc，见上）
 
 **取舍：**
 - 选 3 放弃了：方案 2 的零成本 steer（session 对象直调）与零成本 live 事件（subscribe 推流）——v1 因此没有 steer（由 D5 占位），事件要自己解析 JSONL。
 - 放弃 1 的理由：spawn 强制 detached async + 绑定其 TypeBox schema / async run 目录布局 / executor 接口（research.md §1.6），且用户已被其 0.42→0.55 版本漂移打穿过一次（pi-review CHANGELOG）；跨包事件协议不在本包控制内。
-- 放弃 2 的理由（research.md §2.3/§6 实证）：(a) SDK session 面逐版本漂移有实锤（tintinweb 记录 0.80.8 更换 createAgentSession 选项）；(b) in-process child 污染宿主 runtime 有实锤（lite 记录 subagent bindCore 覆盖共享 runtime 致 sendMessage 失败）；(c) 与主 TUI 共享进程内存，直接放大 CC 36.8GB 事故的爆炸半径；(d) subprocess 路线下 transcript-on-disk 从诞生即成立（child 自己写 `--session` JSONL），契合「disk 全集、live 后缀」不变量。
+- 放弃 2 的理由（research.md §2.3/§6 实证）：(a) SDK session 面随版本漂移有实锤；(b) in-process child 污染宿主 runtime 有实锤；(c) 与主 TUI 共享进程内存，直接放大 CC 36.8GB 事故的爆炸半径；(d) subprocess 路线下 transcript-on-disk 从诞生即成立，契合「disk 全集、live 后缀」不变量。
 
-**风险承担者：** 本包承担 `--mode json` 事件格式漂移风险 → contract tests 钉住（research.md §3.1 已实测基线）；用户承担 v1 无 steer 的功能缺口（D4/D5 已明示，二期补）。
+**风险承担者：** 本包承担 rpc 事件格式漂移风险 → contract tests 钉住；用户承担 v1 无 steer 的功能缺口（v0.2.0 已由 rpc 原生 steer 补齐）。
 
 ### D2 包形态 — 选：独立包 `pi-agent-panel`
 
@@ -68,6 +70,8 @@
 
 ### D5（新增）steer 的 v1 定位 — 选：接口占位 + 协议预留，实现延后
 
+> **作废记录（v0.2.0，被 D11 取代）**：rpc 路线下 steer 由 pi 官方原生命令覆盖（`RpcClient.steer` / prompt 的 streaming 变体），自研协议整体不再需要。本条保留为决策史。
+
 **候选方案：**
 1. v1 完整实现 steer：写 `control/steer-requests/*.json`（沿用 pi-subagents 文件协议）+ 随包 child steer-runtime 扩展（轮询 inbox → `pi.sendUserMessage(text, {deliverAs:"steer"})` → 写 ack）
 2. **v1 接口含 `steer(id, text): "not-implemented"`，实现抛明确错误** ✅
@@ -98,93 +102,148 @@
 
 **风险承担者：** 本包承担检测失准的风险（用户可用配置覆盖）；快捷键选 `alt+p`（pi-effort 已占 `ctrl+shift+e`、pi-subagents 惯用 `shift+tab`/`alt+t` 域；registerShortcut 冲突时 pi 的行为未验证——未验证项，命令入口兜底）。
 
-## 模块设计
+> **v0.2.0 增补（用户对标 CC v2.1.261 实测截图后的方向修正）：** v1 的「95%×85% 浮窗检查器」形态被否——CC 的事实标准是**全屏接管 + 会话间随时跳转 + 列表即调度入口**。D8-D10 记录本轮增量决策；D5（steer 占位）被 D10 推翻拉入 v2。
 
-### FleetSupervisor（`src/supervisor.ts`）— deep module
+### D8（v0.2.0）面板形态 — 选：全屏 overlay + 组件内双 mode 状态机
+
+**候选方案：**
+1. **全屏 overlay（width 100% / maxHeight 100% / margin 0）+ 单组件内部 `list ⇄ view` 两 mode 切换** ✅
+2. 维持 v1 的 95%×85% 浮窗
+3. 全屏 + 嵌套第二层 overlay 做 transcript 视图
+
+**取舍：** 选 1 放弃了：浮窗的「与主会话同屏」（正是用户要拿掉的）；方案 3 的实现隔离性。选 1 的依据：pi-tui overlay 渲染在整个终端上，100%+margin 0 即真全屏（research.md §6 实证类型与布局代码）；CC 的「enter 往返」本质就是视图状态机，单组件内 mode 切换零嵌套、零额外 overlay 句柄、Esc 语义天然分层（view→list→关闭），也不需要在组件闭包里二次触碰 ctx.ui（stale-ctx 面）。风险：全屏盖住 pi dock（含 editor/footer）——CC 同样如此（截图底部 editor/footer 是它自己布局的一部分），行为对齐。
+
+**风险承担者：** 本包承担 mode 状态机的键盘路由复杂度；用户接受全屏期间看不到主会话滚动输出（Esc 即回）。
+
+### D9（v0.2.0）「跳转」的语义边界 — 选：全屏 transcript 观察 + steer/continue，如实标注与 CC 的差距
+
+**候选方案：**
+1. **enter 进入所选 agent 的全屏 transcript 视图（mode 切换），working 可 s-reply（steer）、completed 可 c-continue（resume 同 session 文件再启 child）** ✅
+2. 复刻 CC 的真·会话接管（跳转后用户的输入直接驱动该 agent 会话）
+3. 不做跳转，保持列表+右栏
+
+**取舍：** 选 1 放弃了：方案 2 的完整接管体验。硬差距如实记录：CC 的 agent 是长驻会话循环，跳转=切换主 REPL 消息源后直接驾驶它；本包 child 是**一次性 headless 任务**，运行中只能 steer（注入引导），结束后只能 continue（以同一 `--session` 文件再启一个 child 接续对话——进程已退出无第二写者，v1 无租约的 D6 决策在此恰好成立）。选 3 则连 CC 的基本动线都不满足。方案 1 是 subprocess 架构下「随时跳转」的诚实上限；若未来要真接管，需要长驻 child（`--mode rpc`/交互驻留），列入远期。
+
+**风险承担者：** 用户承担「跳转≠驾驶」的期望差（steer/continue 已覆盖 CC 的 space-to-reply 主线）；本包承担 continue 场景的 session 文件并发边界（仅终态后可 continue，代码强制）。
+
+### D10（v0.2.0，推翻 D5）steer — 选：v2 实现（文件 inbox + child runtime 注入）
+
+> **作废记录（v0.2.0 定稿，被 D11 取代）**：本条是 r1（一次性 child）路线的预写决策，实施前路线已切换到长驻 rpc——steer 归 pi 官方 `steer` 命令，`child-steer-runtime.ts` 已删除，未进入任何发布版本。保留为决策史。
+
+**候选方案：**
+1. **Supervisor.steer 真实现：写 `<childDir>/steer/*.json` 请求文件；child 经 `--extension <child-steer-runtime.ts>`（`--no-extensions` 下显式 `-e` 仍生效，pi --help 实证）注入 ~40 行 runtime，轮询 inbox → `pi.sendUserMessage(text, {deliverAs:"steer"})` → 写 last-ack.json** ✅
+2. 维持 D5 的占位（"not-implemented"）
+3. 沿用 pi-subagents 完整协议（capability 文件 + per-request ack + input 事件关联）
+
+**取舍：** 选 1 放弃了：D5 的「不新增 child 侧攻击面」保守立场（用户对标 CC space-to-reply 后，steer 从 nice-to-have 变为主线需求，砍掉它则 D9 的跳转没有灵魂）；方案 3 的多 child fanout 可靠性机制（我们是 1:1 持句柄场景，ack 只做诊断不做状态机）。风险控制：runtime 独立单文件、零相对依赖、env 未设即 no-op、sendUserMessage 鸭子类型探测（沿用 pi-subagents 实证模式，且该 API 已官方收录）；ack 文件仅供集成测试与排障。
+
+**风险承担者：** 本包承担 steer 时机边界（child 已终态则拒绝："not-running"；mid-turn 注入语义由 pi 官方 sendUserMessage 保证）；用户承担 steer 对一次性任务的效果依赖任务性质（类似 CC steer）。
+
+### D11（v0.2.0 定稿）rpc 会话池架构 — 选：长驻 `pi --mode rpc` child + RpcSessionFactory seam
+
+> 来源：proposal-v2.md r3（用户评审+修订+审查通过）。本条取代 D5/D10 的 steer 方案与 D9 的「跳转=只读观察」边界。
+
+**候选方案：**
+1. **长驻 rpc child（经宿主包 `RpcClient`）：跳转=真对话、steer/abort/awaiting 全官方原生、NotificationBridge 语义升级为 turn-end** ✅
+2. r1 一次性 child（`--mode json -p` + 文件 inbox steer + continue）：工程量小约 50%，但到不了「像正常对话」（proposal §0 对照表）
+3. 先 r1 后 r2 分两步：r1 的 steer runtime 投入会被 r2 整体作废
+
+**取舍：** 选 1 放弃了：方案 2 的小工程量与零常驻资源；一次性 child 的「进程跑完即退」资源模型（v2 每个 child 是完整 pi 进程常驻 → limit 从 8 收紧到 4，归档即释放）。关键子决策（proposal §3/§4，全部已拍板）：
+- **状态推导事件优先**：`agent_start`/`agent_end` 推 isStreaming（`agent_end.willRetry=true` 不算 turn 结束，避免 retry 间隙闪烁）；spawn 后一次 `getState()` 对齐初态；750ms 定时器只刷 UI。实现期补充：RpcClient 不暴露 exit 回调，空闲期崩溃检测只能靠慢速 liveness 探针（默认 5s 一次 `getState()`，仅判死，不作状态源）——记为对「事件优先」的必要让步。
+- **通知抑制双维度**：origin（panel 发起 → 静默）+ view 焦点（正被查看 → 静默）；仅后台 turn 结束回注。crash 一律回注（除正被查看）；archive 永不回注。
+- **composer**：pi-tui `Editor` 内嵌（CJK/粘贴/光标免费），运行中提交自动走 steer 语义；crashed/archived agent 的 composer 禁用并提示，`R` 预留 revive 二期入口。
+- **child 隔离**：`--no-extensions --no-skills` + `PI_AGENT_PANEL_CHILD=1`；`extension_ui_request`（select/confirm/input/editor 四类等待型）主动回 `cancelled`（经 child stdin 原始 JSONL 行——RpcClient 无公开应答 API，`send()` 会覆写请求 id 且等 30s 超时，故触达私有 process 句柄，收敛在 rpc-session.ts 一处）。
+- **归档持久化**：`~/.pi/agent/agent-panel/state.json` 记 archivedIds，跨面板开关/重启保持隐藏（revive 是二期，当前只做隐藏语义与磁盘保留）。
+- **模型继承**：spawn 时若可取到主会话模型则一次性转发（`provider/id`），之后 child 自己的 setModel 归 child。
+- **孤儿自愈**：实证 rpc-mode stdin EOF → shutdown → exit；父进程无论怎么死管道都关，child 全部自杀，无需清扫器（integration test 断言）。
+
+**风险承担者：** 本包承担 RpcClient 私有面（process.stdin 触达）与宿主包同步演化的风险（同进程同版本，漂移面收敛为「pi 升级时 contract/integration 会先红」）；用户承担常驻内存（默认上限 4 个完整 pi 进程）与 abort 在工具执行中表现为 `stopReason:"error"` 的显示差异。
+
+## 模块设计（v0.2.0）
+
+```
+FleetSupervisor    ← deep module，seam 之所在：RpcSessionFactory
+                     （生产：rpc-session.ts 包装宿主 RpcClient；测试：fake-rpc.ts 脚本化回放）
+                     spawn/prompt/steer/abort/archive/pin/list/tail/onEvent/dispose
+                     零 TUI 代码、零 pi 运行时依赖
+RpcSession (seam)  ← prompt/steer/abort/getState/stop/onEvent —— 一个长驻 rpc child
+FleetPanel         ← 薄 adapter #1：全屏 overlay + list⇄view 状态机 + 常驻 Editor composer
+NotificationBridge ← 薄 adapter #2：turn-end 回注 + origin/view 双维度抑制 + 防重 + 配额
+StatusPill         ← 薄 adapter #3：三段计数 widget（N working · M awaiting）+ auto-yield
+extensions/index.ts← 组装：命令 / 快捷键 / 生命周期 / globalStore 防 /reload / focus 通道
+```
+
+### FleetSupervisor（`extensions/lib/supervisor.ts`）— deep module
 
 ```ts
-export interface AgentSpec {
-  name: string;            // panel display name (also child dir stem)
-  prompt: string;
-  cwd: string;
-  model?: string;          // forwarded as --model
-}
-export interface AgentHandle {          // read-only plain-data snapshot, render-safe
-  id: string;
-  name: string;
-  state: "starting" | "running" | "completed" | "failed" | "stopped";
-  startedAt: number;
-  endedAt?: number;
-  exitCode?: number;
-  tokens: { input: number; output: number; cost: number };
-  toolCount: number;
-  sessionFile: string;      // child's own --session JSONL (full history)
-  eventsFile: string;       // raw stdout event-line mirror (full set)
-  lastLine: string;         // latest assistant text (roster preview)
-  currentTool?: string;
-}
+export interface AgentSpec { name; cwd; model?; prompt? }   // prompt = 首条消息（background origin）
+export type AgentState = "starting" | "working" | "awaiting-input" | "crashed" | "archived";
+export interface AgentHandle { /* render-safe 纯数据快照：id/name/state/tokens/toolCount/
+  turnCount/sessionFile/eventsFile/lastLine/currentTool/lastActivityAt/pendingCount/pinned */ }
 export type SupervisorEvent =
-  | { type: "agent-added"; handle: AgentHandle }
-  | { type: "agent-updated"; handle: AgentHandle }
-  | { type: "agent-final"; handle: AgentHandle };   // terminal exactly once per child
-
-export interface ProcessRunner {       // internal seam: real spawn vs test fake
-  spawn(cmd: string, args: string[], opts: { cwd: string; env: Record<string, string | undefined> }):
-    { pid: number; kill(signal?: NodeJS.Signals): void; stdout: AsyncIterable<string> } & Disposable;
-}
+  | { type: "agent-added" | "agent-updated"; handle }
+  | { type: "turn-ended"; handle; origin: "panel" | "background" }   // agent_end 且 !willRetry
+  | { type: "agent-final"; handle };                                  // crash（恰好一次）
 export class FleetSupervisor {
-  constructor(deps: { runner?: ProcessRunner; rootDir?: string; piBinary?: string; limit?: number; now?: () => number });
-  spawn(spec: AgentSpec): AgentHandle;        // throws if at limit (default 8) or duplicate live name
-  steer(id: string, _text: string): "not-implemented";  // D5: seam placeholder, phase 2
-  interrupt(id: string): boolean;             // SIGINT (graceful); false if not running
-  stop(id: string): boolean;                  // SIGINT → grace (2s) → SIGKILL; marks stopped
-  list(): AgentHandle[];                      // fresh snapshot array (plain copies)
-  tail(id: string, maxLines: number): string[]; // read events-file tail, IO-safe (never throws)
-  onEvent(cb: (e: SupervisorEvent) => void): () => void;
-  dispose(): void;                            // kill all, clear timers; idempotent
+  constructor(deps: { sessionFactory?; rootDir?; limit? = 4; probeMs? = 5000 });
+  spawn(spec): Promise<AgentHandle>;          // 起 rpc child + getState 对齐 + 可选首条 prompt
+  prompt(id, text, origin?): Promise<boolean>; // 空闲→prompt；working→自动降级 steer；记录 origin
+  abort(id): Promise<boolean>;                 // 打断当前轮，agent 存活
+  archive(id): Promise<boolean>;               // 隐藏+kill+state.json 持久化；JSONL 保留
+  pin(id, pinned?): boolean;
+  list(): AgentHandle[];
+  tail(id, maxLines): string[];                // IO-safe 事件镜像尾读
+  onEvent(cb): () => void;
+  dispose(): void;                             // stop 全部 child；幂等
 }
 ```
 
-- spawn 管线（research.md §1.3 精简版）：`<piBinary> --mode json -p --no-extensions --no-skills --session <fresh> [--model m] ["Task: ..." | @file]`，`piBinary` 解析顺序 env `PI_AGENT_PANEL_PI_BINARY` → `process.execPath`+pi CLI（`process.argv[1]` 同目录）→ `"pi"` PATH 兜底；prompt > 8000 字符走临时 md `@file`；env 增 `PI_AGENT_PANEL_CHILD=1`；`stdio: ["ignore","pipe","pipe"]`（stderr 尾部保留 4KB ring，终态时落 `stderr.log` 供 post-mortem）。**实现期修正（research.md §5.2）：`--permission-mode` 是扩展注册 flag 而非内建，`--no-extensions` 的 child 会拒收——默认不传，`AgentSpec.permissionMode` 仅显式指定时转发。**
-- stdout 处理：逐行 `JSON.parse` 容错非 JSON 行；全行 append `eventsFile`（磁盘全集）；`message_end`(assistant) 聚合 usage（input+output+cacheRead+cacheWrite+cost.total，对齐 execution.ts:750-757）与 lastLine；`tool_execution_start/end` 聚合 toolCount/currentTool。**零行级内存镜像**——每 handle 常驻内存只有上表标量（比 CC 50 条上限更紧，「disk 是全集，live 是后缀」）。
-- 终态判定：`agent-final` 恰好发一次。优先级：stop() 干预 → `stopped`；进程 exit 0 且收到 terminalAssistantStop（`message_end` assistant `stopReason==="stop"` 无 toolCall，research.md §1.3）→ `completed`；exit 非 0 → `failed`。exit 与终态消息乱序：exit 后 500ms drain 窗口再定态（对齐 pi-subagents final-drain 模式）。
-- 生命周期：不在构造函数里启动任何 watcher（官方要求，research.md §3）；无轮询——事件驱动（stdout 行推进 + 进程 exit），`tail()` 由面板按需调用。
-- 单测经 fake ProcessRunner 注入（不碰真进程）；contract/integration test 用真 pi。
+- 事件三路分发：① 聚合进 handle（tokens/toolCount/lastLine/isStreaming）② `JSON.stringify(evt)` 镜像落 `events.jsonl`（rpc 下镜像 = onEvent 对象再序列化，非原始 stdout 行——RpcClient 不暴露原始行；「disk 全集、live 后缀」不变量不变）③ turn 结束沿 → `turn-ended` 事件。
+- 状态推导（D11）：`agent_start` → working；`agent_end && !willRetry` → awaiting-input + turn-ended；spawn 后一次 `getState()` 对齐初态；liveness 探针（默认 5s）只用于空闲期死亡检测。
+- child 目录 `~/.pi/agent/agent-panel/<id>/`：`session.jsonl`（child 自写全集）、`events.jsonl`（镜像）、`crash.log`（崩溃原因）；归档集在 `~/.pi/agent/agent-panel/state.json`。
+- 单测经 fake RpcSessionFactory（`test/unit/fake-rpc.ts` 脚本化事件回放）；真进程只出现在 integration/contract。
 
-### FleetPanel（`src/panel.ts`）— 薄 adapter #1
+### rpc-session.ts — 真 adapter（RpcClient 包装）
 
-- 打开：`ctx.ui.custom((tui, theme, _kb, done) => new FleetPanelComponent(tui, theme, supervisor, done), { overlay: true, overlayOptions: { anchor: "center", width: "95%", minWidth: 60, maxHeight: "85%", margin: 1 } })`（fleet.ts:400-408 同参）。
-- **render 纯函数（比 fleet.ts 更严）**：`refresh()`（750ms 定时器回调 + 键盘触发）里做 `supervisor.list()` + `supervisor.tail(selected, 200)` 存入组件字段；`render(width)` 只读缓存，**无 ctx、无 IO、无异常路径**。dispose 清定时器。
-- 布局：左 roster（38% 宽 clamp 22-46：状态点 + name + tokens + lastLine 截断）+ 右 transcript 尾（wrapTextWithAnsi）；宽 < 36 降级单行提示（fleet.ts:357 同款）。
-- 键位：`j/k/↑/↓` 选择（selectedKey 保持跨刷新稳定）、`enter` 聚焦并自动跟随、`PgUp/PgDn` 翻滚（解除跟随）、`x` stop（二次确认：再按 x）、`i` interrupt、`r` 强制刷新、`Esc/ctrl+c/q` 关闭。
-- 头部标注包名与活 child 计数；footer 列键位摘要与选中位置。
+- `resolvePiCliPath()`（pi-spawn.ts）：env `PI_AGENT_PANEL_PI_BINARY` → pi 宿主 argv[1]（校验属于 pi 包）→ 已安装包 bin；**必须解析出 node 可执行脚本**（RpcClient 固定 `spawn("node", [cliPath, ...])`），PATH 上的 wrapper 二进制不可用——解析失败在 spawn 时抛明确错误。
+- options：`{ cliPath, cwd, env: {PI_AGENT_PANEL_CHILD=1}, args: ["--no-extensions","--no-skills","--session",<file>], model? }`。
+- `extension_ui_request` 主动 deny：等待型四类（select/confirm/input/editor）立即向 child stdin 写 `{"type":"extension_ui_response","id":…,"cancelled":true}` 原始 JSONL 行（见 D11 私有面说明）；面板 transcript 显示 `⚠ child ui request denied: <title>`。
 
-### NotificationBridge（`src/bridge.ts`）— 薄 adapter #2
+### FleetPanel（`extensions/lib/panel.ts`）— 薄 adapter #1
 
-- 订阅 `onEvent`，过滤 `agent-final`：`pi.sendMessage({ customType: "agent-panel-notification", content: <一行摘要：name/state/tokens/duration>, display: true, details: {id, name, state, tokens, exitCode, sessionFile, eventsFile} }, { triggerTurn: true, deliverAs: "followUp" })`（对齐 CC `<task-notification>` 模式与 tintinweb 实现，research.md §2.1）。
-- 防重：`notifiedIds: Set<string>`（终态恰好一次，与 CC notified 标志同构）。
-- 配额：单 session 上限 50 条，超限静默丢弃并计数（防通知风暴）。
-- 容错：sendMessage 全程 try/catch，`"Extension context no longer active"` 类错误吞掉（模式抄 index.ts:590-596）；其余错误吞掉并保留 notifiedIds（通知是 best-effort，不得反杀宿主）。
+- 打开：`ctx.ui.custom(..., { overlay: true, overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 } })` —— 全屏盖住 pi dock。
+- **render 纯函数**：`refresh()`（750ms 定时器 + 键处理上下文）做 `list()`/`tail()`；`render(width)` 只读缓存与组件内 Editor，无 ctx、无 IO、无异常路径。
+- list mode：头部三段计数（N working · M awaiting input · K archived）+ 分组行（Pinned/Working/Awaiting input/Archived，crashed 归 Archived 组红 ✗）。
+- view mode：头部 agent 详情行 + transcript（tail 渲染，▶ 用户 / 助手全文 / ⚙ 工具 / ⚠ denied）+ 常驻 composer。
+- composer：pi-tui `Editor` 内嵌（identity selectList 主题——无 autocomplete 路径不触发；paddingX 1）。输入焦点模型：view mode 下 nav 键（j/k/PgUp/PgDn/x/enter/space/←/esc）归面板，其余可打印字符激活 composer（type-to-talk）；composer 激活时一切输入归 Editor，esc 取消草稿。
+- 键位（proposal §2.3 全表）：list `j/k ↑/↓` 选择 · `enter` 跳入 · `space` 跳入+聚焦 composer · `n` 新任务 composer（首行派生名字，enter = spawn+跳入）· `x` 打断当前轮 · `X`/`ctrl+x` 归档 · `p` pin · `esc/q` 关闭；view `enter/space` 聚焦 composer · `j/k` 逐行滚动 · `PgUp/PgDn` 翻页 · `x` 打断 · `←`/`esc` 返回列表 · `R` 预留 revive 提示。
+- crashed/archived agent 的 view：composer 禁用 + 提示 + session 文件路径（`R` 提示二期）。
 
-### StatusPill（`src/pill.ts`）— 薄 adapter #3
+### NotificationBridge（`extensions/lib/bridge.ts`）— 薄 adapter #2
 
-- 内容：单行 `⏵ agent-panel: N running · M done — alt+p`，running>0 用 accent，全闲用 dim。
-- 更新：订阅 supervisor onEvent + 打开/关闭面板时刷新；经 fresh ctx（命令/事件回调携带）调用 `ctx.ui.setWidget("agent-panel-status", line)`，不缓存 ctx。
-- auto-yield（D7）：注册前 `shouldYieldPill(pi)` 检查 `pi.getAllTools()` 的 `sourceInfo`（stringify 后含 `claude-code-tui` 即让位）；配置 `~/.pi/agent/agent-panel/config.json` 的 `pill: "auto"|"on"|"off"` 覆盖检测结果。
+- 触发点 v2 = `turn-ended`（非 v1 的进程终态）；抑制规则（D11）：origin=panel → 静默；focus.current=该 agent → 静默；其余回注 `pi.sendMessage(..., { triggerTurn: true, deliverAs: "followUp" })`，内容含 sessionFile。
+- `agent-final`（crash）：除正被查看外一律回注（用户需要知道后台 agent 死了）；archived 永不回注。
+- 防重：`notifiedTurns` keyed by `<id>:<turnCount>`（每 turn 至多一次）；配额 50；sendMessage 全程 try/catch。
+- focus 通道：`PanelFocus { current: string | null }` 由 index.ts 持有，Panel 写（view 进入/离开/关闭）、Bridge 读。
+
+### StatusPill（`extensions/lib/pill.ts`）— 薄 adapter #3
+
+- 内容：`⏵ agent-panel: N working · M awaiting — alt+p`（working accent / awaiting success）；全闲 dim。
+- 更新：主会话 `tool_result` + supervisor `onEvent` 双触发（v2 增：child 活动即刷新，不必等主会话动作）；经 lastCtx 调 `ctx.ui.setWidget`，不缓存 stale ctx。
+- auto-yield（D7 不变）。
 
 ### 组装（`extensions/index.ts`）
 
-- factory 只做注册（命令/快捷键/session 事件监听），**不启动任何资源**（官方要求）；早退条件 `process.env.PI_AGENT_PANEL_CHILD === "1"`（v1 child 用 `--no-extensions` 不装任何扩展，env 标记是防御纵深）。
-- `session_start`：建 Supervisor + Bridge + Pill；`session_shutdown`：`dispose()` + 清 widget（幂等，stale 错误吞掉）。
-- `/reload` 防陈旧：globalStore 存 dispose 引用，重复加载先清理（模式抄 pi-subagents index.ts:195-204）。
-- `/agent-panel`：无参开面板；`/agent-panel spawn <name> <prompt>` 快捷入口（v1 的 spawn 唯一入口，D4）；`/agent-panel stop <name|id>`。
-- 快捷键 `alt+p` 开关面板（D7）。
+- factory 只做注册，不启动资源；早退 `PI_AGENT_PANEL_CHILD === "1"`。
+- `session_start`：Supervisor + focus + Bridge + Pill + pill 事件刷新订阅；`session_shutdown` / globalStore 防 `/reload`（幂等）。
+- 命令：`/agent-panel`（开面板）、`/agent-panel spawn <name> <prompt...>`（spawn+首条 prompt，主会话模型一次性转发）、`/agent-panel archive <name|id>`（`stop` 保留为别名）。
+- 快捷键 `alt+p`（D7；命令入口兜底——Mac 终端 Option-as-Meta 配置差异见 README）。
 
-## 验收标准（全部可验证/可复现）
+## 验收标准（v0.2.0，全部可验证/可复现）
 
-1. **单测**：`pnpm test` 全绿（node:test + fake ProcessRunner）——覆盖：spawn→starting→running→completed/failed/stopped 状态机、usage/toolCount/lastLine 聚合、非 JSON 行容错、drain 窗口、stop 宽限→SIGKILL、limit/duplicate 拒绝、agent-final 恰好一次、tail 容错、dispose 幂等、steer 占位报错。
-2. **contract test**（真实 CLI）：`pi --mode json -p --no-session "Reply with exactly: pong"` 产物断言——首行 `type==="session" && version===3`、每行可 JSON.parse 或标记为容错行、存在 `message_end`(assistant, stopReason 合法)、末尾出现 `agent_settled`（实测基线 research.md §3.1，防 pi 升级漂移）。
-3. **integration test**（真实 CLI，node:test 驱动 Supervisor）：spawn 真 child（短 prompt）→ 状态到 completed → agent-final 回调一次 → eventsFile/sessionFile 存在且非空 → stop 场景（长任务 child）状态翻 stopped → exitCode 记录。
-4. **扩展加载冒烟**：`pi -e ./extensions --no-session -p "say ok"` 退出码 0、stderr 无未捕获异常（验证 factory 注册路径 + child 早退不炸）。
-5. **类型**：`pnpm typecheck`（tsc --noEmit）零错误。
-6. **手动交互**（人工，README 记录操作序列）：交互 pi 里 `/agent-panel spawn demo <短任务>` → alt+p 开面板 → 列表出现 ● running → j/k 选择 → enter 看 transcript 增长 → x x 确认 stop → 状态翻 ■ stopped → Esc 关闭 → 主会话收到 agent-panel-notification 回注（triggerTurn 生效：主 agent 被唤醒处理）。
+1. **单测**：`pnpm test` 全绿（fake rpc session）——覆盖：spawn→starting→(getState 对齐)→awaiting、agent_start/end 状态机（含 willRetry 不结束 turn）、prompt 空闲/working 自动 steer 降级 + origin 透传、abort 语义、归档（隐藏+stop+state.json+幂等+事件忽略）、crash（探针失败/发送失败→agent-final 恰好一次）、limit 4、重名、pin、dispose 幂等、镜像 tail 与 denied 行、抑制矩阵（origin/focus/dedupe/配额/crash/archive）、面板 list⇄view/composer(CJK/取消/type-to-talk)/x/X/p/焦点通道。
+2. **contract test**：不变全绿（`--mode json` 事件流钉子；rpc 与 json 同族事件，钉子同样护住 rpc 解析面）。
+3. **integration test**（真 rpc child）：同 child 第二轮对话（真对话核心）、运行中 abort 后 agent 存活可续问、归档后 `pgrep` 无匹配残留进程、孤儿自愈（stdin EOF → 限时退出）。
+4. **扩展加载冒烟**：`pi -e ./extensions --no-session -p "say ok"` 退出码 0、stderr 干净。
+5. **类型**：`pnpm typecheck` 零错误。
+6. **手动交互**（人工，README 记录序列）：`/agent-panel` 全屏 → `n` 输中文任务 → enter 跳入 → 流式输出 → composer 追问（第二轮真对话）→ `←` 返回 → `x` 打断长任务 → `X` 归档 → 关 pi 后无残留进程。

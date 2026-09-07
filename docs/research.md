@@ -143,7 +143,19 @@
 
 5. **`--permission-mode` 不是 pi 内建 flag**——`pi --help` 明示「Extensions can register additional flags」，该 flag 由 permission 扩展（如用户的 pi-permission-modes）注册。pi-args.ts:133-143 的转发因此混入了生态自定义 flag：child 以 `--no-extensions` 启动时该 flag 直接 `Unknown option` 退出（实测复现）。**教训：pi-args 的 flag 清单 ≠ 内建 CLI 面**；本包 buildChildArgs 仅在显式请求时转发它，默认不带。headless child 的默认工具权限行为（不带该 flag 时 pi -p 如何裁决工具调用）未验证，列入 README 已知限制。
 
-## 6. 版本漂移风险台账（与 D1 联动）
+## 6. CC agent panel v2.1.261 拆解（用户实测截图，2026-09-07）
+
+> 本地 CC 源码快照（/Users/gd32/Coding/claude-code/src）落后于 v2.1.261，无对应组件；以下以用户提供的运行截图为规格，结合旧版拆解（handoff：渲染即换消息源、viewSelectionMode 状态机）交叉印证。
+
+- **全屏接管**：列表占满整个终端视口（非浮窗 dialog）；底部保留输入框（placeholder "Describe a task for a new session"）与 footer 键位行——即「主内容区整体切换 + editor/footer 常驻」。pi 对应物：pi-tui overlay 渲染在整个终端上（tui.js resolveOverlayLayout 以 termWidth/termHeight 为基准，margin 才会收缩可用区），`width:"100%" + maxHeight:"100%" + margin:0` 即真全屏（类型 OverlayOptions 实证，tui.d.ts:134-156）。
+- **分组列表**：`Pinned / Working / Completed` 三组；行结构 = 状态点 + 会话名 + 最新活动摘要（一句话）+ 会话 id + 相对时间。
+- **头部计数**：`0 awaiting input · 1 working · 5 completed`——CC 语义中 awaiting input = 等用户输入的 agent。
+- **随时跳转**：选中 + enter 进入该会话视图（旧版实现 = REPL 切换 displayedMessages 消息源），会话视图里 enter 返回列表（"enter to return"）。列表/会话两级视图 + enter 往返是核心动线。
+- **space to reply**：列表上直接对选中 agent 输入回复（steer）；对已结束会话则是 continue 语义（对应 lite 的 running→steer / ended→continue 动词区分，research.md §2.2）。
+- **ctrl+x to delete**、**? for shortcuts**、**bypass permissions 徽标**（权限模式回显，二期 permission 桥接范畴）。
+- **从列表直接 spawn**：底部输入框输入任务描述即创建新会话——panel 是一等调度入口（不是只读检查器）。
+
+## 7. 版本漂移风险台账（与 D1 联动）
 
 - 证据链：tintinweb 源码注释记录 0.80.8 更换 `createAgentSession` 选项（agent-runner.js:758）；本地 pi-subagents devDeps 钉 0.81.0 vs 当前 CLI 0.85.1；tintinweb peerDeps >=0.84.0——**SDK 类型面约每 1-2 个 minor 漂移一次**，而 CLI 面（flag 集 + `--mode json` 事件流）自 0.81→0.85 稳定（本地包实证）。
 - 依赖策略：运行期零 `@earendil-works/*` 硬依赖（扩展宿主自带）；类型仅 devDependency + `import type`（构建期擦除）；组件协议类型（Component/TUI）鸭子类型降级或最小本地声明。对外契约只钉 CLI 面，用 contract tests 固化（§3.1）。

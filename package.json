@@ -1,7 +1,7 @@
 {
   "name": "pi-agent-panel",
-  "version": "0.1.0",
-  "description": "Actionable multi-agent fleet panel for the pi coding agent: spawn, watch, interrupt and stop headless child pi sessions from a single TUI overlay",
+  "version": "0.2.0",
+  "description": "Actionable multi-agent fleet panel for the pi coding agent: run background rpc agent sessions, jump into any of them and keep talking — the Claude Code agent-panel experience in one terminal",
   "type": "module",
   "keywords": [
     "pi-package",

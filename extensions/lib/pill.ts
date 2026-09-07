@@ -43,9 +43,12 @@ export function shouldYieldPill(pi: ExtensionAPI): boolean {
 	return false;
 }
 
-export function pillLine(liveCount: number, theme: ExtensionContext["ui"]["theme"]): string[] {
-	if (liveCount > 0) {
-		return [theme.fg("accent", `⏵ agent-panel: ${liveCount} running`) + theme.fg("dim", ` · ${PANEL_SHORTCUT_HINT}`)];
+export function pillLine(working: number, awaiting: number, theme: ExtensionContext["ui"]["theme"]): string[] {
+	if (working > 0 || awaiting > 0) {
+		const parts: string[] = [];
+		if (working > 0) parts.push(theme.fg("accent", `${working} working`));
+		if (awaiting > 0) parts.push(theme.fg("success", `${awaiting} awaiting`));
+		return [theme.bold("⏵ agent-panel:") + ` ${parts.join(theme.fg("dim", " · "))}` + theme.fg("dim", ` · ${PANEL_SHORTCUT_HINT}`)];
 	}
 	return [theme.fg("dim", `⏵ agent-panel idle · ${PANEL_SHORTCUT_HINT}`)];
 }
@@ -65,9 +68,10 @@ export function createStatusPill(
 	return {
 		update: (ctx: ExtensionContext) => {
 			if (!ctx.hasUI) return;
-			const live = supervisor.list().filter((handle) => handle.endedAt === undefined).length;
+			const working = supervisor.list().filter((h) => h.state === "working" || h.state === "starting").length;
+			const awaiting = supervisor.list().filter((h) => h.state === "awaiting-input").length;
 			try {
-				ctx.ui.setWidget(PILL_WIDGET_KEY, pillLine(live, ctx.ui.theme));
+				ctx.ui.setWidget(PILL_WIDGET_KEY, pillLine(working, awaiting, ctx.ui.theme));
 			} catch {
 				// Widget slots are best-effort; never break the caller.
 			}

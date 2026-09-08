@@ -2,6 +2,14 @@
 
 ## Unreleased fixes (2026-09-08, post-0.2.0)
 
+- **Interaction revisions (user feedback)**: list mode supports type-to-talk
+  (any printable non-command key opens the new-task composer — no `n`
+  needed); submitting a new task stays in the list with the fresh agent
+  selected instead of auto-jumping into its view; in view mode, `←` returns
+  to the list even while the composer is focused, as long as the draft is
+  empty (a non-empty draft still moves the cursor, so drafts are never lost
+  to an accidental arrow).
+
 - **Keyboard input under the Kitty keyboard protocol**: terminals with Kitty
   protocol active (Ghostty/kitty/iTerm2 and friends) encode plain keys as
   CSI-u sequences, so the panel's bare-character comparisons (`n`, `x`, `X`,

@@ -41,13 +41,13 @@ pi -e ./path/to/pi-agent-panel/extensions
 | `j/k` `↑/↓` | move selection | scroll transcript line by line |
 | `enter` | jump into agent | focus composer |
 | `space` | jump in + focus composer | focus composer |
-| type any character | — | starts composing (type-to-talk) |
-| `n` | new-task composer (name derived from first line; enter = spawn + jump in) | — |
+| type any character | starts a new-task composer (type-to-talk) | starts composing (type-to-talk) |
+| `n` | new-task composer (same as typing directly) | — |
 | `x` | abort current turn of selected agent (rpc abort, agent stays alive) | abort current turn |
 | `X` / `ctrl+x` | archive selected (kill + hide; `pi --session <file>` can reopen) | — |
 | `p` | pin/unpin | — |
 | `PgUp/PgDn` | — | page transcript (stops auto-follow) |
-| `←` / `esc` | (esc) close panel | back to list |
+| `←` / `esc` | (esc) close panel | back to list (`←` works even with the composer focused while the draft is empty) |
 | composer `enter` / `esc` | submit / cancel draft | submit (working → steer) / cancel draft |
 
 The panel composer is a real pi-tui `Editor`: CJK/IME input, multi-line, terminal paste, cursor/kill/yank all work. While the agent is working, the same submit is delivered as a native steering message — one input box, correct semantics in both phases.
@@ -55,8 +55,8 @@ The panel composer is a real pi-tui `Editor`: CJK/IME input, multi-line, termina
 ### Manual verification sequence (interactive pi)
 
 1. `pi -e ./extensions` → `/agent-panel` (or `alt+p`) — the panel covers the whole terminal, header shows `0 working · 0 awaiting input · 0 archived`.
-2. Press `n`, type a Chinese task (e.g. `用一句话解释缓存失效`), press `enter` — the agent spawns and the panel jumps straight into its conversation view.
-3. Watch the transcript stream (`▶` your task, assistant text, `⚙ tool` lines). When the turn ends the header flips to `awaiting-input`.
+2. Just start typing a Chinese task (e.g. `用一句话解释缓存失效`) — the new-task composer opens directly — then press `enter`. The agent spawns, the list stays put with the new agent selected (`started '…' — enter to open`).
+3. Press `enter` on the selected agent to jump into its conversation. Watch the transcript stream (`▶` your task, assistant text, `⚙ tool` lines). When the turn ends the header flips to `awaiting-input`; press `←` (empty composer) to return to the list.
 4. Type a follow-up question in the composer and press `enter` — a **second turn on the same child** (real conversation, context preserved).
 5. Press `←` to return to the list. Start a long task (`n` → `用 bash 执行 sleep 60 并等待`), jump in, press `x` — the turn aborts, the agent survives, you can keep asking.
 6. Press `X` on an agent — it moves to `Archived`, the process is gone, and `~/.pi/agent/agent-panel/<id>/session.jsonl` remains (`pi --session <file>` reopens it).

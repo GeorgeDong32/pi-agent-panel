@@ -180,9 +180,15 @@ export class FleetPanelComponent {
 		// Kitty protocol (flag 2) delivers key-release events too; without a
 		// filter every press would be processed twice.
 		if (isKeyRelease(data)) return;
+		this.statusMessage = ""; // transient hints live until the next key
 		if (this.composerActive) {
 			if (matchesKey(data, "escape")) {
 				this.cancelComposer();
+				return;
+			}
+			// On an empty draft, ← means "leave the view", not "move the cursor".
+			if (this.mode === "view" && this.editor.getText().length === 0 && matchesKey(data, "left")) {
+				this.backToList();
 				return;
 			}
 			this.editor.handleInput(data); // enter submits via editor.onSubmit
@@ -217,6 +223,12 @@ export class FleetPanelComponent {
 			this.refresh();
 			this.tui.requestRender();
 			return;
+		}
+		// Any other printable input starts a new task directly (type-to-talk);
+		// kitty CSI-u sequences and legacy bytes (incl. IME CJK) both count.
+		if (decodeKittyPrintable(data) !== undefined || (data.length > 0 && !isControlSequence(data))) {
+			this.activateComposer("new-task");
+			this.editor.handleInput(data);
 		}
 	}
 
@@ -335,12 +347,10 @@ export class FleetPanelComponent {
 			this.supervisor
 				.spawn({ name: deriveTaskName(trimmed), cwd: this.deps.cwd, prompt: trimmed, ...(this.deps.model ? { model: this.deps.model } : {}) })
 				.then((handle) => {
-					this.statusMessage = "";
-					this.mode = "view";
-					this.viewId = handle.id;
-					if (this.deps.focus) this.deps.focus.current = handle.id;
-					this.transcriptAutoFollow = true;
-					this.activateComposer("reply");
+					// Stay in the list (user revision): select the new agent
+					// and hint the way in, instead of jumping to its view.
+					this.statusMessage = `started '${handle.name}' — enter to open, ← esc stays here`;
+					this.selectedKey = handle.id;
 					this.refresh();
 					this.tui.requestRender();
 				})
@@ -442,6 +452,7 @@ export class FleetPanelComponent {
 
 	private listBody(width: number, height: number): string[] {
 		const lines: string[] = [];
+		if (this.statusMessage) lines.push(this.theme.fg("warning", this.statusMessage));
 		if (this.rows.length === 0) {
 			lines.push(this.theme.fg("dim", "No agents — press n to start a new task, or /agent-panel spawn <name> <prompt>"));
 		} else {

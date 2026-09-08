@@ -120,7 +120,7 @@ test("view focus channel tracks the viewed agent for suppression", async () => {
 	assert.equal(h.focus.current, null);
 });
 
-test("composer: n → CJK task → enter spawns with derived name and jumps to view", async () => {
+test("composer: n → CJK task → enter spawns with derived name, stays in list", async () => {
 	const h = createPanelHarness();
 	h.panel.handleInput("n");
 	assert.ok(h.panel.render(WIDTH).join("\n").includes("new task:"), "composer hint");
@@ -132,12 +132,44 @@ test("composer: n → CJK task → enter spawns with derived name and jumps to v
 	const spawned = h.supervisor.list()[0] as AgentHandle;
 	assert.equal(spawned.name, "调查缓存问题");
 	assert.deepEqual((h.sessions[0] as FakeRpcSession).sends.map((s) => s.text), ["调查缓存问题"]);
-	// After spawn the panel jumps into the view with the composer still live.
+	// User revision: no auto-jump — stay in the list, select the new agent.
 	h.panel.invalidate();
 	const text = h.panel.render(WIDTH).join("\n");
-	assert.ok(text.includes("调查缓存问题"), "view header shows new agent");
-	assert.ok(text.includes("enter send"), "reply composer active");
-	assert.equal(h.focus.current, spawned.id);
+	assert.ok(text.includes("started '调查缓存问题'"), "started hint");
+	assert.ok(text.includes("jk select"), "still in list mode");
+	assert.equal(h.focus.current, null);
+});
+
+test("list mode: typing a printable character opens the new-task composer directly", async () => {
+	const h = createPanelHarness();
+	h.panel.handleInput("重"); // type-to-talk straight into a new task
+	h.panel.invalidate();
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("new task:"), "composer opened by typing");
+	h.panel.handleInput("构问题");
+	h.panel.handleInput("\r");
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(h.supervisor.list()[0]?.name, "重构问题");
+});
+
+test("view mode: ← on an empty composer returns to the list without esc", async () => {
+	const h = createPanelHarness();
+	const { handle } = await spawnAgent(h, "a");
+	h.panel.invalidate();
+	h.panel.handleInput("\r"); // enter → view + composer focused
+	assert.equal(h.focus.current, handle.id);
+	h.panel.handleInput("\x1b[D"); // ← with an empty draft → back to list
+	h.panel.invalidate();
+	assert.equal(h.focus.current, null);
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("jk select"), "back in list");
+	// With text in the draft, ← moves the cursor instead of leaving.
+	h.panel.handleInput(" "); // space → view + composer focused
+	h.panel.handleInput("d");
+	h.panel.handleInput("r");
+	h.panel.handleInput("\x1b[D"); // ← over a non-empty draft
+	h.panel.invalidate();
+	const still = h.panel.render(WIDTH).join("\n");
+	assert.ok(still.includes("enter send"), "still composing in view");
+	assert.ok(!still.includes("jk select"), "did not leave the view");
 });
 
 test("composer reply in view: submit prompts with panel origin; esc cancels draft", async () => {

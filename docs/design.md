@@ -159,6 +159,8 @@
 
 **风险承担者：** 本包承担 RpcClient 私有面（process.stdin 触达）与宿主包同步演化的风险（同进程同版本，漂移面收敛为「pi 升级时 contract/integration 会先红」）；用户承担常驻内存（默认上限 4 个完整 pi 进程）与 abort 在工具执行中表现为 `stopReason:"error"` 的显示差异。
 
+> **交互修订（2026-09-08，用户实测后提出，三项）**：① list 模式支持 type-to-talk——任何非命令可打印字符（kitty CSI-u 与 legacy 字节皆可）直接开新任务 composer，`n` 保留为显式入口；② 新任务提交后**不再自动跳入对话视图**，留在列表并选中新 agent（`started '…' — enter to open` 提示，任意键消失）；③ view 模式中 composer 为空草稿时 `←` 直接返回列表（此前 `←` 被 composer 吞成光标移动，必须先 esc——空框内移光标无意义）。非空草稿时 `←` 仍移动光标，防误触丢稿。
+
 ## 模块设计（v0.2.0）
 
 ```

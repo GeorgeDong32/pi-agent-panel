@@ -436,25 +436,27 @@ export class FleetPanelComponent {
 	}
 
 	private listBody(width: number, height: number): string[] {
-		if (this.rows.length === 0) {
-			return [
-				this.theme.fg("dim", "No agents — press n to start a new task, or /agent-panel spawn <name> <prompt>"),
-			];
-		}
-		const start = Math.max(0, Math.min(this.selected - height + 1, Math.max(0, this.rows.length - height)));
-		const window = this.rows.slice(start, start + height);
 		const lines: string[] = [];
-		let lastGroup = "";
-		for (let offset = 0; offset < window.length; offset++) {
-			const row = window[offset];
-			if (!row) break;
-			if (row.group !== lastGroup) {
-				lastGroup = row.group;
-				lines.push(this.groupLabel(row.group));
+		if (this.rows.length === 0) {
+			lines.push(this.theme.fg("dim", "No agents — press n to start a new task, or /agent-panel spawn <name> <prompt>"));
+		} else {
+			const start = Math.max(0, Math.min(this.selected - height + 1, Math.max(0, this.rows.length - height)));
+			const window = this.rows.slice(start, start + height);
+			let lastGroup = "";
+			for (let offset = 0; offset < window.length; offset++) {
+				const row = window[offset];
+				if (!row) break;
+				if (row.group !== lastGroup) {
+					lastGroup = row.group;
+					lines.push(this.groupLabel(row.group));
+				}
+				lines.push(this.rosterLine(row.handle, start + offset === this.selected, width));
 			}
-			lines.push(this.rosterLine(row.handle, start + offset === this.selected, width));
 		}
-		return lines;
+		// Pad to full height: the overlay is as tall as the component's output,
+		// so short content would leave the host UI visible below the panel.
+		while (lines.length < height) lines.push("");
+		return lines.slice(0, height);
 	}
 
 	private groupLabel(group: string): string {

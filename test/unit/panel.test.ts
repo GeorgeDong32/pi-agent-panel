@@ -42,11 +42,15 @@ const WIDTH = 100;
 
 test("empty roster renders guidance, groups header and footer hints", () => {
 	const { panel } = createPanelHarness();
-	const text = panel.render(WIDTH).join("\n");
+	const lines = panel.render(WIDTH);
+	const text = lines.join("\n");
 	assert.ok(text.includes("agent-panel"), "header present");
 	assert.ok(text.includes("No agents"), "empty-roster guidance present");
 	assert.ok(text.includes("n new task"), "footer hints present");
 	assert.ok(text.includes("esc close"), "esc hint present");
+	// Fullscreen contract: output spans the full terminal height (rows=30 in
+	// the stub) — short output would leave the host UI visible below.
+	assert.equal(lines.length, 30);
 });
 
 test("narrow width degrades to a single hint line", () => {

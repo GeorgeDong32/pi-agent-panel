@@ -38,7 +38,21 @@ export function shouldYieldPill(pi: ExtensionAPI): boolean {
 			if (sourceInfo && JSON.stringify(sourceInfo).includes("claude-code-tui")) return true;
 		}
 	} catch {
-		// Attribution unavailable: do not yield on speculation.
+		// Attribution unavailable: fall through to the settings-based check.
+	}
+	// Fallback: the package list names the TUI skin even when its tools carry
+	// no sourceInfo (observed with the git-installed pi-claude-code-tui fork).
+	try {
+		const settingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
+		const raw = JSON.parse(fs.readFileSync(settingsPath, "utf-8")) as { packages?: unknown };
+		if (
+			Array.isArray(raw.packages) &&
+			raw.packages.some((entry) => typeof entry === "string" && entry.includes("claude-code-tui"))
+		) {
+			return true;
+		}
+	} catch {
+		// Settings unreadable: do not yield on speculation.
 	}
 	return false;
 }

@@ -118,8 +118,25 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 				ctx.ui.notify(`agent-panel: archived '${item.name}' (session file kept: ${item.sessionFile})`, "info");
 				return;
 			}
+			if (parts[0] === "detach") {
+				// Optional target; default = the attached agent whose session the
+				// main REPL currently owns (i.e. "return to my own conversation").
+				const target = parts[1];
+				const rt = ensureCore();
+				const currentSession = ctx.sessionManager.getSessionFile();
+				const attached = rt.supervisor.list().filter((handle) => handle.attached);
+				const item = target
+					? attached.find((handle) => handle.id === target || handle.name === target)
+					: attached.find((handle) => handle.sessionFile === currentSession) ?? (attached.length === 1 ? attached[0] : undefined);
+				if (!item) {
+					ctx.ui.notify("agent-panel: no attached agent to detach (are you inside its session?)", "warning");
+					return;
+				}
+				await performDetach(ctx, item.id);
+				return;
+			}
 			if (args.trim()) {
-				ctx.ui.notify("Usage: /agent-panel [spawn <name> <prompt...> | archive <name|id>]", "warning");
+				ctx.ui.notify("Usage: /agent-panel [spawn <name> <prompt...> | archive <name|id> | detach [name|id]]", "warning");
 				return;
 			}
 			if (panelOpen) return;
@@ -218,6 +235,31 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 			}
 			if (draft.length > 0) return;
 			await openPanelViaShortcut(ctx);
+		},
+	});
+
+	// The mirror move: → on an empty input returns to the previous
+	// conversation. If the main REPL currently owns an attached agent's
+	// session, dispatch `/agent-panel detach` through sendUserMessage's
+	// command dispatch — that gives the action a fresh command context,
+	// which switchSession requires. Non-empty drafts stay hands-off.
+	pi.registerShortcut("right", {
+		description: "Return to the previous conversation (detach the attached agent)",
+		handler: (ctx: ExtensionContext) => {
+			let draft = "";
+			try {
+				draft = ctx.ui.getEditorText();
+			} catch {
+				return;
+			}
+			if (draft.length > 0) return;
+			const rt = ensureCore();
+			const currentSession = ctx.sessionManager.getSessionFile();
+			const attached = rt.supervisor.list().find(
+				(handle) => handle.attached && handle.sessionFile === currentSession,
+			);
+			if (!attached) return; // not inside an attached session — nothing to return from
+			pi.sendUserMessage(`/agent-panel detach ${attached.id}`, { expandPromptTemplates: true });
 		},
 	});
 

@@ -2,6 +2,14 @@
 
 ## Unreleased (2026-09-08, evening)
 
+- **`→` (empty input) returns to your own conversation** — the mirror of
+  `←`. Inside an attached agent's session it dispatches `/agent-panel
+  detach` through `sendUserMessage`'s command dispatch (fresh command
+  context, which `switchSession` requires); the agent respawns background
+  supervision and the main REPL switches back. New `/agent-panel detach
+  [name|id]` subcommand. pty-verified end to end. Note: overriding ←/→
+  makes pi show an informational `[Extension issues]` banner after session
+  switches; rebind the editor cursor keys to ctrl+b/ctrl+f to silence it.
 - **Bare `←` now opens the panel on an empty input** — CC's exact "← for
   agents" semantics. pi shortcuts have no empty-input condition, but the
   handler can read the draft (`ctx.ui.getEditorText()`, which follows the

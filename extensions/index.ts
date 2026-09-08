@@ -118,6 +118,22 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 				ctx.ui.notify(`agent-panel: archived '${item.name}' (session file kept: ${item.sessionFile})`, "info");
 				return;
 			}
+			if (parts[0] === "takeover") {
+				const target = parts[1];
+				if (!target) {
+					ctx.ui.notify("Usage: /agent-panel takeover <name|id>", "warning");
+					return;
+				}
+				const item = ensureCore()
+					.supervisor.list()
+					.find((handle) => handle.id === target || handle.name === target);
+				if (!item) {
+					ctx.ui.notify(`agent-panel: no agent matches '${target}'`, "warning");
+					return;
+				}
+				await performTakeover(ctx, item.id);
+				return;
+			}
 			if (parts[0] === "detach") {
 				// Optional target; default = the attached agent whose session the
 				// main REPL currently owns (i.e. "return to my own conversation").
@@ -188,9 +204,12 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 		}
 	};
 
-	/** Shared panel entry for shortcut contexts (alt+p, shift+left). switchSession
-	 *  lives on the command context only, so takeover/detach selected here ask
-	 *  the user to rerun /agent-panel — every other panel action works. */
+	/** Shared panel entry for shortcut contexts (←, shift+left, alt+p).
+	 *  switchSession lives on the command context only, so a takeover/detach
+	 *  picked here is dispatched as its `/agent-panel takeover|detach` command
+	 *  via sendUserMessage — the dispatch runs the command with a fresh
+	 *  command context, exactly like typing it (the message itself is not
+	 *  persisted and does not trigger a model turn). */
 	const openPanelViaShortcut = async (ctx: ExtensionContext): Promise<void> => {
 		if (panelOpen) return;
 		panelOpen = true;
@@ -200,8 +219,10 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 				ensureCore().supervisor,
 				ensureCore().focus,
 			);
-			if (action?.takeover || action?.detach) {
-				ctx.ui.notify("agent-panel: takeover/detach needs the command context — run /agent-panel and press enter/d there", "warning");
+			if (action?.takeover) {
+				pi.sendUserMessage(`/agent-panel takeover ${action.takeover}`, { expandPromptTemplates: true });
+			} else if (action?.detach) {
+				pi.sendUserMessage(`/agent-panel detach ${action.detach}`, { expandPromptTemplates: true });
 			}
 		} catch {
 			// e.g. runtime missing in odd modes; the command path reports details.

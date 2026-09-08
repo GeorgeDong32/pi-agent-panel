@@ -2,6 +2,14 @@
 
 ## Unreleased (2026-09-08, evening)
 
+- **Takeover/detach work from shortcut-opened panels too** (user feedback:
+  the "needs the command context" warning broke the ← → enter flow). Panel
+  actions are now dispatched as `/agent-panel takeover|detach <id>` via
+  `sendUserMessage`'s command dispatch — same mechanism the → key uses —
+  giving the action a fresh command context for `switchSession`. The
+  dispatched message is never persisted and does not trigger a model turn.
+  New `/agent-panel takeover <name|id>` subcommand. pty-verified full loop:
+  ← panel → enter takeover → → detach, no warnings, no stale errors.
 - **`→` (empty input) returns to your own conversation** — the mirror of
   `←`. Inside an attached agent's session it dispatches `/agent-panel
   detach` through `sendUserMessage`'s command dispatch (fresh command

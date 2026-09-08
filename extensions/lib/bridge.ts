@@ -1,7 +1,7 @@
 /**
  * NotificationBridge — thin adapter #2: finished background turns and crashes
- * are injected back into the main session as followUp messages (CC's
- * <task-notification> pattern).
+ * are injected back into the main session as display-only custom messages
+ * (CC's task-notification pattern: visible, but the main loop is left alone).
  *
  * Suppression rules (proposal §3.7 — the anti-notification-storm core):
  *   (a) turn initiated from the panel composer (origin "panel") → silent,
@@ -66,7 +66,13 @@ export function createNotificationBridge(
 						eventsFile: handle.eventsFile,
 					},
 				},
-				{ triggerTurn: true, deliverAs: "followUp" },
+				// Silent injection (CC's task-notification leaves the main loop
+				// alone too): triggerTurn:false appends the card to the transcript
+				// without driving an LLM turn — verified against sendCustomMessage's
+				// delivery matrix; with triggerTurn:true the main session burned a
+				// real model round reacting to every notification (pty-observed),
+				// which read as "duplicate notification cards" in practice.
+				{ triggerTurn: false },
 			);
 		} catch {
 			// Stale-host or send failures are non-fatal by design.

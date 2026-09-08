@@ -154,6 +154,32 @@ test("events are mirrored to events.jsonl and tail formats them", async () => {
 	assert.deepEqual(supervisor.tail("nope", 10), []);
 });
 
+test("tailEvents returns parsed events with a dropped count; onChildEvent taps raw stream", async () => {
+	const { supervisor, sessions } = createHarness();
+	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	const session = sessions[0] as FakeRpcSession;
+	const tapped: Array<[string, string]> = [];
+	const unsubscribe = supervisor.onChildEvent((id, evt) => tapped.push([id, String(evt.type)]));
+	emitTurn(session, "do the thing", "working on it");
+	await waitFor(() => supervisor.tailEvents(handle.id, 50).events.length >= 3, 2000, "mirror flush");
+	const all = supervisor.tailEvents(handle.id, 50);
+	assert.equal(all.dropped, 0);
+	assert.deepEqual(all.events.map((e) => e.type), ["agent_start", "message_end", "message_end", "agent_end"]);
+	const sliced = supervisor.tailEvents(handle.id, 2);
+	assert.equal(sliced.events.length, 2);
+	assert.equal(sliced.dropped, 2, "older entries counted as dropped");
+	assert.deepEqual(
+		supervisor.tailEvents("nope", 10),
+		{ events: [], dropped: 0 },
+	);
+	// Raw tap saw every mirrored event with the child id; unsubscribe stops it.
+	assert.ok(tapped.every(([id]) => id === handle.id));
+	assert.ok(tapped.some(([, type]) => type === "message_end"));
+	unsubscribe();
+	session.emit({ type: "agent_start" });
+	assert.equal(tapped.filter(([, type]) => type === "agent_start").length, 1, "tap detached after unsubscribe");
+});
+
 test("crash via failed probe flips state, emits agent-final exactly once", async () => {
 	const { supervisor, sessions } = createHarness({ probeMs: 15 });
 	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });

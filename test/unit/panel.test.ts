@@ -5,10 +5,14 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { FleetPanelComponent } from "../../extensions/lib/panel.ts";
 import { createHarness, emitTurn, type FakeRpcSession } from "./fake-rpc.ts";
 import type { AgentHandle } from "../../extensions/lib/types.ts";
 import type { TUI } from "@earendil-works/pi-tui";
+
+// Conversation components read pi's global theme at render time.
+initTheme(undefined, false);
 
 const fakeTheme = {
 	fg: (_name: string, text: string) => text,
@@ -247,19 +251,23 @@ test("view of a crashed agent: composer refuses with a hint", async () => {
 	assert.equal(session.sends.length, 0, "nothing sent to a dead agent");
 });
 
-test("transcript pane mirrors tail output in view mode", async () => {
+test("view mode renders a native conversation (bubbles + tool card)", async () => {
 	const h = createPanelHarness();
-	const { session, handle } = await spawnAgent(h, "talker");
+	const { session } = await spawnAgent(h, "talker");
 	emitTurn(session, "task text", "第一行回答\n第二行回答");
+	session.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "read", args: { path: "a.ts" } });
+	session.emit({ type: "tool_execution_end", toolCallId: "t1", toolName: "read", result: { content: [{ type: "text", text: "file body" }] }, isError: false });
 	// The events mirror flushes asynchronously; wait for it before reading.
 	await new Promise((resolve) => setTimeout(resolve, 60));
 	h.panel.invalidate();
 	h.panel.handleInput("\r");
 	h.panel.invalidate();
 	const text = h.panel.render(WIDTH).join("\n");
-	assert.ok(text.includes("▶ task text"), "user line");
+	assert.ok(text.includes("task text"), "user bubble text");
 	assert.ok(text.includes("第一行回答"), "assistant line 1");
 	assert.ok(text.includes("第二行回答"), "assistant line 2");
+	assert.ok(text.includes("read"), "tool card title");
+	assert.ok(text.includes("file body"), "tool card result");
 });
 
 test("kitty keyboard protocol sequences drive the same actions; releases ignored", async () => {

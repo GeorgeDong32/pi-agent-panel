@@ -2,6 +2,24 @@
 
 ## Unreleased fixes (2026-09-08, post-0.2.0)
 
+- **Silent notifications (user feedback: "duplicate notification cards")**:
+  pty capture proved the render layer shows each card exactly once (883/883
+  frames); the perceived duplication came from `triggerTurn: true` — the
+  main session launched a real model round reacting to every notification
+  (observed running `bash` on its own initiative). Notifications are now
+  injected with `triggerTurn: false` (pure transcript append in both idle
+  and streaming host states), matching CC's task-notification behavior.
+
+- **Native conversation view (user feedback: "jump in like CC's normal
+  session screen")**: the panel's view mode no longer renders hand-rolled
+  transcript text. A new `ConversationView` replays the mirrored rpc event
+  stream into pi's own message components (`UserMessageComponent`,
+  `AssistantMessageComponent`, `ToolExecutionComponent`) — the same markdown
+  bubbles and tool cards the main REPL renders. Supervisor gained
+  `tailEvents` (raw event bootstrap, capped at 400 with a truncation hint)
+  and `onChildEvent` (live growth tap). Tool cards use the component
+  fallback style because pi's exports map blocks its built-in renderers.
+
 - **Interaction revisions (user feedback)**: list mode supports type-to-talk
   (any printable non-command key opens the new-task composer — no `n`
   needed); submitting a new task stays in the list with the fresh agent

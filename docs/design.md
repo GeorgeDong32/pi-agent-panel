@@ -194,8 +194,10 @@ export class FleetSupervisor {
   archive(id): Promise<boolean>;               // 隐藏+kill+state.json 持久化；JSONL 保留
   pin(id, pinned?): boolean;
   list(): AgentHandle[];
-  tail(id, maxLines): string[];                // IO-safe 事件镜像尾读
+  tail(id, maxLines): string[];                // IO-safe 事件镜像尾读（格式化行）
+  tailEvents(id, maxEvents): { events; dropped }; // IO-safe 原始事件尾读（view 引导）
   onEvent(cb): () => void;
+  onChildEvent(cb(id, evt)): () => void;       // 原始事件旁路（view 实时生长）
   dispose(): void;                             // stop 全部 child；幂等
 }
 ```
@@ -214,16 +216,24 @@ export class FleetSupervisor {
 ### FleetPanel（`extensions/lib/panel.ts`）— 薄 adapter #1
 
 - 打开：`ctx.ui.custom(..., { overlay: true, overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 } })` —— 全屏盖住 pi dock。
-- **render 纯函数**：`refresh()`（750ms 定时器 + 键处理上下文）做 `list()`/`tail()`；`render(width)` 只读缓存与组件内 Editor，无 ctx、无 IO、无异常路径。
+- **render 纯函数**：`refresh()`（750ms 定时器 + 键处理上下文）做 `list()`；`render(width)` 只读缓存与组件内 Editor，无 ctx、无 IO、无异常路径。
 - list mode：头部三段计数（N working · M awaiting input · K archived）+ 分组行（Pinned/Working/Awaiting input/Archived，crashed 归 Archived 组红 ✗）。
-- view mode：头部 agent 详情行 + transcript（tail 渲染，▶ 用户 / 助手全文 / ⚙ 工具 / ⚠ denied）+ 常驻 composer。
+- view mode：头部 agent 详情行 + **原生对话渲染**（ConversationView）+ 常驻 composer。
 - composer：pi-tui `Editor` 内嵌（identity selectList 主题——无 autocomplete 路径不触发；paddingX 1）。输入焦点模型：view mode 下 nav 键（j/k/PgUp/PgDn/x/enter/space/←/esc）归面板，其余可打印字符激活 composer（type-to-talk）；composer 激活时一切输入归 Editor，esc 取消草稿。
 - 键位（proposal §2.3 全表）：list `j/k ↑/↓` 选择 · `enter` 跳入 · `space` 跳入+聚焦 composer · `n` 新任务 composer（首行派生名字，enter = spawn+跳入）· `x` 打断当前轮 · `X`/`ctrl+x` 归档 · `p` pin · `esc/q` 关闭；view `enter/space` 聚焦 composer · `j/k` 逐行滚动 · `PgUp/PgDn` 翻页 · `x` 打断 · `←`/`esc` 返回列表 · `R` 预留 revive 提示。
 - crashed/archived agent 的 view：composer 禁用 + 提示 + session 文件路径（`R` 提示二期）。
 
+### ConversationView（`extensions/lib/conversation.ts`）— 原生对话渲染
+
+- **动机（2026-09-08，用户实测「不能像 CC 那样跳到正常 session 界面」）**：对照 CC 源码（/Users/gd32/Coding/claude-code/src）实证其 agent panel 机制——没有独立 panel 组件，`REPL.tsx:4509` `displayedMessages = viewedAgentTask.messages`，同一个 `<Messages>` 渲染器换消息源；进入时 disk bootstrap（retain + 读盘合并去重），查看时输入框提交 = steer/续跑（`onAgentSubmit`）。pi 的 child 是独立 OS 进程、宿主 REPL 无消息源 seam，字面复刻不可行；但**渲染保真度**可行：view 直接用 pi 导出的同名组件画 child 的会话流。
+- 回放规则（镜像 interactive-mode rebuild 路径）：`message_end(user)` → `UserMessageComponent`；`message_end(assistant)` → `AssistantMessageComponent` + 每个 toolCall 一张卡；`tool_execution_start` → `ToolExecutionComponent` 实时出现；`tool_execution_end` → `updateResult`（乱序时结果先存 `finishedResults`，卡片后建时补挂）；`cardIds` 集合保证一个 callId 至多一张卡。
+- 主题：组件读 pi 全局 theme（`getMarkdownTheme()` 与组件内 singleton），与主 REPL 同源同色。pi 的 exports map 不导出内建工具渲染器（read/bash/edit 深层导入被 ERR_PACKAGE_PATH_NOT_EXPORTED 挡）→ 工具卡走组件自带 fallback（粗体工具名 + 参数 + 输出预览）。
+- 引导时序：`enterView()` 同一 tick 内先 `tailEvents(id, 400)` 引导、再 `onChildEvent` 订阅——JS 单线程下零丢失零重复；引导截断显示「… N older events not shown」提示。渲染按宽度缓存，apply 才失效。
+- 单测注意：组件渲染期读全局 theme，测试环境需先 `initTheme(undefined, false)`（conversation/panel 测试已加）。
+
 ### NotificationBridge（`extensions/lib/bridge.ts`）— 薄 adapter #2
 
-- 触发点 v2 = `turn-ended`（非 v1 的进程终态）；抑制规则（D11）：origin=panel → 静默；focus.current=该 agent → 静默；其余回注 `pi.sendMessage(..., { triggerTurn: true, deliverAs: "followUp" })`，内容含 sessionFile。
+- 触发点 v2 = `turn-ended`（非 v1 的进程终态）；抑制规则（D11）：origin=panel → 静默；focus.current=该 agent → 静默；其余回注 `pi.sendMessage(..., { triggerTurn: false })`，内容含 sessionFile。**行为修订（2026-09-08 pty 实证）**：`triggerTurn: true` 会让主会话对每条通知真的启动一轮 LLM 响应（capture 里主 agent 自跑 bash 应答）——观感即用户报告的「重复通知卡片」；改为 `triggerTurn: false`（idle→纯 append，streaming→turn 尾 flush append，两种状态都不驱动 LLM，sendCustomMessage 交付矩阵核实过），对齐 CC task-notification「可见但打断主循环」语义。另：pty 分帧统计（883 帧单帧均 1 次）证明渲染层无双显 bug。
 - `agent-final`（crash）：除正被查看外一律回注（用户需要知道后台 agent 死了）；archived 永不回注。
 - 防重：`notifiedTurns` keyed by `<id>:<turnCount>`（每 turn 至多一次）；配额 50；sendMessage 全程 try/catch。
 - focus 通道：`PanelFocus { current: string | null }` 由 index.ts 持有，Panel 写（view 进入/离开/关闭）、Bridge 读。

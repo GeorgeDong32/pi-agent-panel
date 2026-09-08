@@ -69,7 +69,8 @@ test("background turn end notifies once with session file in the payload", () =>
 	assert.ok(message.content.includes("alpha finished a turn"));
 	assert.ok(message.content.includes("session: /tmp/s.jsonl"));
 	assert.equal(message.details.sessionFile, "/tmp/s.jsonl");
-	assert.equal(options.triggerTurn, true);
+	// Silent injection: the card must NOT drive a main-session LLM turn.
+	assert.equal(options.triggerTurn, false);
 });
 
 test("panel-origin turns are suppressed (the user is driving them)", () => {

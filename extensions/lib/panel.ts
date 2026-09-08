@@ -9,17 +9,18 @@
  * factory — no ctx, no IO, no throws. The stale-ExtensionContext trap is
  * structurally unreachable here.
  */
-import { decodeKittyPrintable, isKeyRelease, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Editor } from "@earendil-works/pi-tui";
+import { decodeKittyPrintable, isKeyRelease, matchesKey, truncateToWidth, visibleWidth, Editor } from "@earendil-works/pi-tui";
 import type { TUI } from "@earendil-works/pi-tui";
 import type { AgentHandle } from "./types.ts";
 import type { FleetSupervisor } from "./supervisor.ts";
+import { ConversationView } from "./conversation.ts";
 
 type Theme = import("@earendil-works/pi-coding-agent").ExtensionContext["ui"]["theme"];
 /** Panel only styles via fg/bold; accepting the narrower type keeps tests fake-able. */
 type PanelTheme = Pick<Theme, "fg" | "bold">;
 
 const REFRESH_MS = 750;
-const TRANSCRIPT_LINES = 400;
+const BOOTSTRAP_EVENTS = 400;
 const NEW_TASK_NAME_LIMIT = 24;
 
 function fit(text: string, width: number): string {
@@ -78,7 +79,8 @@ export class FleetPanelComponent {
 	private rows: Array<{ handle: AgentHandle; group: string }> = [];
 	private selected = 0;
 	private selectedKey: string | undefined;
-	private transcript: string[] = [];
+	private conversation: ConversationView | undefined;
+	private droppedBootstrap = 0;
 	private transcriptAutoFollow = true;
 	private transcriptScroll = 0;
 	private transcriptLineCount = 0;
@@ -88,6 +90,7 @@ export class FleetPanelComponent {
 	private disposed = false;
 	private readonly timer: ReturnType<typeof setInterval>;
 	private readonly editor: Editor;
+	private readonly unsubscribeChild: () => void;
 
 	private readonly tui: { requestRender(force?: boolean): void; terminal?: { rows?: number } };
 	private readonly theme: PanelTheme;
@@ -125,6 +128,14 @@ export class FleetPanelComponent {
 			{ paddingX: 1 },
 		);
 		this.editor.onSubmit = (text) => this.submitComposer(text);
+		// Live conversation growth: raw child events for the viewed agent are
+		// applied to the view as they arrive (same tick bootstrap+subscribe in
+		// enterView() means no gap and no duplicates).
+		this.unsubscribeChild = supervisor.onChildEvent((id, evt) => {
+			if (this.disposed || !this.conversation || this.viewId !== id) return;
+			this.conversation.apply(evt);
+			this.tui.requestRender();
+		});
 		this.refresh();
 		this.timer = setInterval(() => {
 			if (this.disposed) return;
@@ -141,11 +152,7 @@ export class FleetPanelComponent {
 			const handle = this.items.find((item) => item.id === this.viewId);
 			if (!handle) {
 				// Archived-away or otherwise gone: fall back to the list.
-				this.mode = "list";
-				this.viewId = undefined;
-				this.composerActive = false;
-			} else {
-				this.transcript = this.supervisor.tail(handle.id, TRANSCRIPT_LINES);
+				this.backToList();
 			}
 		}
 		this.rebuildRows();
@@ -284,21 +291,34 @@ export class FleetPanelComponent {
 	private openSelected(focusComposer: boolean): void {
 		const handle = this.rows[this.selected]?.handle;
 		if (!handle) return;
-		this.mode = "view";
-		this.viewId = handle.id;
-		if (this.deps.focus) this.deps.focus.current = handle.id;
-		this.transcriptAutoFollow = true;
-		this.transcriptScroll = 0;
-		this.transcript = [];
-		this.statusMessage = "";
+		this.enterView(handle.id);
 		if (focusComposer) this.activateComposer("reply");
 		this.refresh();
 		this.tui.requestRender();
 	}
 
+	/** Swap to view mode over `id`: bootstrap the conversation from the
+	 *  mirrored event tail, then (same tick) subscribe for live events. */
+	private enterView(id: string): void {
+		this.mode = "view";
+		this.viewId = id;
+		if (this.deps.focus) this.deps.focus.current = id;
+		this.transcriptAutoFollow = true;
+		this.transcriptScroll = 0;
+		this.transcriptLineCount = 0;
+		this.statusMessage = "";
+		// Components read pi's global theme (same palette as the main REPL).
+		this.conversation = new ConversationView({ ui: this.tui, cwd: this.deps.cwd });
+		const boot = this.supervisor.tailEvents(id, BOOTSTRAP_EVENTS);
+		this.droppedBootstrap = boot.dropped;
+		for (const evt of boot.events) this.conversation.apply(evt);
+	}
+
 	private backToList(): void {
 		this.mode = "list";
 		this.viewId = undefined;
+		this.conversation = undefined;
+		this.droppedBootstrap = 0;
 		if (this.deps.focus) this.deps.focus.current = null;
 		this.composerActive = false;
 		this.editor.setText("");
@@ -512,12 +532,14 @@ export class FleetPanelComponent {
 			lines.push(this.theme.fg("error", `agent ${handle.state === "crashed" ? "crashed" : "archived"} — composer disabled, session file: ${handle.sessionFile}`));
 		}
 		if (this.statusMessage) lines.push(this.theme.fg("warning", this.statusMessage));
+		// Conversation lines come from pi's own message components, already
+		// wrapped to `width`; one blank line between messages is built in.
 		const detailLines: string[] = [];
-		for (const line of this.transcript) {
-			const wrapped = wrapTextWithAnsi(line, Math.max(1, width));
-			detailLines.push(...(wrapped.length ? wrapped : [""]));
+		if (this.droppedBootstrap > 0) {
+			detailLines.push(this.theme.fg("dim", `… ${this.droppedBootstrap} older events not shown (full history: session file)`));
 		}
-		if (detailLines.length === 0) {
+		if (this.conversation) detailLines.push(...this.conversation.render(width));
+		if (detailLines.length === (this.droppedBootstrap > 0 ? 1 : 0)) {
 			detailLines.push(this.theme.fg("dim", handle?.state === "starting" ? "(starting rpc child…)" : "(no output yet — send the first message)"));
 		}
 		this.transcriptLineCount = detailLines.length;
@@ -549,6 +571,7 @@ export class FleetPanelComponent {
 
 	dispose(): void {
 		this.disposed = true;
+		this.unsubscribeChild();
 		if (this.deps.focus) this.deps.focus.current = null;
 		clearInterval(this.timer);
 	}

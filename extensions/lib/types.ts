@@ -80,6 +80,11 @@ export interface RpcAgentEvent {
 		stopReason?: string;
 	};
 	toolName?: string;
+	/** tool_execution_* fields (conversation view replays these into cards). */
+	toolCallId?: string;
+	args?: unknown;
+	result?: unknown;
+	isError?: boolean;
 	/** agent_end: another attempt follows (auto-retry) — not a turn boundary. */
 	willRetry?: boolean;
 	/** extension_ui_request fields (actively denied by the adapter). */

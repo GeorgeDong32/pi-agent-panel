@@ -100,6 +100,8 @@ export class FleetSupervisor {
 	private readonly probeMs: number;
 	private readonly children = new Map<string, ChildRecord>();
 	private readonly listeners = new Set<(event: SupervisorEvent) => void>();
+	/** Raw per-child rpc events, tapped for the panel's conversation view. */
+	private readonly rawListeners = new Set<(id: string, event: RpcAgentEvent) => void>();
 	private readonly archivedIds: Set<string>;
 	private disposed = false;
 
@@ -275,9 +277,33 @@ export class FleetSupervisor {
 	 * render paths depend on this.
 	 */
 	tail(id: string, maxLines: number): string[] {
-		const record = this.children.get(id);
-		if (!record || maxLines <= 0) return [];
+		const lines = this.readEventWindow(id).flatMap((evt) => {
+			if (typeof evt === "string") return [evt];
+			return formatEventLines(evt);
+		});
+		return lines.slice(-Math.max(0, maxLines));
+	}
+
+	/**
+	 * Read the raw event tail for the conversation view: parsed rpc events,
+	 * oldest first, at most `maxEvents` of them, plus how many older entries
+	 * exist in the window but were dropped (the view shows a truncation hint).
+	 * IO-safe like tail(): failures yield an empty result, never a throw.
+	 */
+	tailEvents(id: string, maxEvents: number): { events: RpcAgentEvent[]; dropped: number } {
+		const window = this.readEventWindow(id);
+		const events = window.filter((evt): evt is RpcAgentEvent => typeof evt !== "string");
+		const sliced = events.slice(-Math.max(0, maxEvents));
+		return { events: sliced, dropped: window.length - sliced.length };
+	}
+
+	/** Every event in the trailing TAIL_READ_BYTES window (parsed; unparsable
+	 *  lines pass through as strings), oldest first, untruncated. */
+	private readEventWindow(id: string): Array<RpcAgentEvent | string> {
+		const out: Array<RpcAgentEvent | string> = [];
 		try {
+			const record = this.children.get(id);
+			if (!record) return out;
 			const stat = fs.statSync(record.handle.eventsFile);
 			const length = Math.min(stat.size, TAIL_READ_BYTES);
 			const buffer = Buffer.alloc(length);
@@ -290,19 +316,27 @@ export class FleetSupervisor {
 			const raw = buffer.toString("utf-8");
 			// Drop the potentially-truncated first line of the window.
 			const window = stat.size > length ? raw.slice(raw.indexOf("\n") + 1) : raw;
-			const lines: string[] = [];
 			for (const line of window.split("\n")) {
 				if (!line.trim()) continue;
 				try {
-					lines.push(...formatEventLines(JSON.parse(line) as RpcAgentEvent));
+					out.push(JSON.parse(line) as RpcAgentEvent);
 				} catch {
-					lines.push(line);
+					out.push(line);
 				}
 			}
-			return lines.slice(-maxLines);
 		} catch {
-			return [];
+			// Fall through with whatever was parsed.
 		}
+		return out;
+	}
+
+	/** Subscribe to raw per-child rpc events (id, event). Panel view uses
+	 *  this to grow the conversation live; unsubscribe stops the tap. */
+	onChildEvent(listener: (id: string, event: RpcAgentEvent) => void): () => void {
+		this.rawListeners.add(listener);
+		return () => {
+			this.rawListeners.delete(listener);
+		};
 	}
 
 	onEvent(callback: (event: SupervisorEvent) => void): () => void {
@@ -327,6 +361,7 @@ export class FleetSupervisor {
 			}
 		}
 		this.listeners.clear();
+		this.rawListeners.clear();
 	}
 
 	private applyEvent(record: ChildRecord, evt: RpcAgentEvent): void {
@@ -339,6 +374,7 @@ export class FleetSupervisor {
 		} catch {
 			// Mirroring is best-effort; supervision continues.
 		}
+		for (const listener of this.rawListeners) listener(handle.id, evt);
 		handle.lastActivityAt = this.now();
 		let changed = true;
 

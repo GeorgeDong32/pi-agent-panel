@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased fixes (2026-09-08, post-0.2.0)
+
+- **Keyboard input under the Kitty keyboard protocol**: terminals with Kitty
+  protocol active (Ghostty/kitty/iTerm2 and friends) encode plain keys as
+  CSI-u sequences, so the panel's bare-character comparisons (`n`, `x`, `X`,
+  `space`, `j/k`, `R`, `q`) never matched — the panel opened but no key
+  reached it. All routing now goes through `matchesKey` (dual legacy + Kitty
+  matching), key-release events are filtered, and type-to-talk accepts both
+  decodable Kitty sequences and legacy printable bytes (incl. IME-committed
+  CJK text, which arrives as raw UTF-8 either way).
+- List mode now pads to the full terminal height (the overlay is as tall as
+  the component's output; short rosters previously left the host UI visible).
+- StatusPill yields when `claude-code-tui` appears in the settings packages
+  list (the git-installed fork carries no tool sourceInfo).
+
 ## 0.2.0 (2026-09-08)
 
 Complete architecture pivot to long-lived rpc children (proposal-v2 r3): the

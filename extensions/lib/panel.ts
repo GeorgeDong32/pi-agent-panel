@@ -9,7 +9,7 @@
  * factory — no ctx, no IO, no throws. The stale-ExtensionContext trap is
  * structurally unreachable here.
  */
-import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Editor } from "@earendil-works/pi-tui";
+import { decodeKittyPrintable, isKeyRelease, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Editor } from "@earendil-works/pi-tui";
 import type { TUI } from "@earendil-works/pi-tui";
 import type { AgentHandle } from "./types.ts";
 import type { FleetSupervisor } from "./supervisor.ts";
@@ -177,6 +177,9 @@ export class FleetPanelComponent {
 
 	handleInput(data: string): void {
 		if (this.disposed) return;
+		// Kitty protocol (flag 2) delivers key-release events too; without a
+		// filter every press would be processed twice.
+		if (isKeyRelease(data)) return;
 		if (this.composerActive) {
 			if (matchesKey(data, "escape")) {
 				this.cancelComposer();
@@ -186,7 +189,7 @@ export class FleetPanelComponent {
 			return;
 		}
 
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || (this.mode === "list" && data === "q")) {
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || (this.mode === "list" && matchesKey(data, "q"))) {
 			if (this.mode === "view") this.backToList();
 			else this.done(undefined);
 			return;
@@ -199,16 +202,16 @@ export class FleetPanelComponent {
 	}
 
 	private handleListInput(data: string): void {
-		if (matchesKey(data, "up") || data === "k") return this.moveSelection(-1);
-		if (matchesKey(data, "down") || data === "j") return this.moveSelection(1);
+		if (matchesKey(data, "up") || matchesKey(data, "k")) return this.moveSelection(-1);
+		if (matchesKey(data, "down") || matchesKey(data, "j")) return this.moveSelection(1);
 		if (matchesKey(data, "home")) return this.moveSelection(-this.rows.length);
 		if (matchesKey(data, "end")) return this.moveSelection(this.rows.length);
 		if (matchesKey(data, "enter")) return this.openSelected(false);
-		if (data === " ") return this.openSelected(true);
-		if (data === "n") return this.activateComposer("new-task");
-		if (data === "x") return this.abortSelected();
-		if (data === "X" || matchesKey(data, "ctrl+x")) return this.archiveSelected();
-		if (data === "p") {
+		if (matchesKey(data, "space")) return this.openSelected(true);
+		if (matchesKey(data, "n")) return this.activateComposer("new-task");
+		if (matchesKey(data, "x")) return this.abortSelected();
+		if (matchesKey(data, "shift+x") || matchesKey(data, "ctrl+x")) return this.archiveSelected();
+		if (matchesKey(data, "p")) {
 			const handle = this.rows[this.selected]?.handle;
 			if (handle) this.supervisor.pin(handle.id);
 			this.refresh();
@@ -219,8 +222,8 @@ export class FleetPanelComponent {
 
 	private handleViewInput(data: string): void {
 		if (matchesKey(data, "left")) return this.backToList();
-		if (matchesKey(data, "up") || data === "k") return this.scrollTranscript(-1);
-		if (matchesKey(data, "down") || data === "j") return this.scrollTranscript(1);
+		if (matchesKey(data, "up") || matchesKey(data, "k")) return this.scrollTranscript(-1);
+		if (matchesKey(data, "down") || matchesKey(data, "j")) return this.scrollTranscript(1);
 		if (matchesKey(data, "pageUp")) {
 			this.transcriptAutoFollow = false;
 			this.transcriptScroll = Math.max(0, this.transcriptScroll - this.viewBodyHeight());
@@ -234,20 +237,22 @@ export class FleetPanelComponent {
 			this.tui.requestRender();
 			return;
 		}
-		if (matchesKey(data, "enter") || data === " ") return this.activateComposer("reply");
-		if (data === "x") {
+		if (matchesKey(data, "enter") || matchesKey(data, "space")) return this.activateComposer("reply");
+		if (matchesKey(data, "x")) {
 			if (this.viewId) void this.supervisor.abort(this.viewId);
 			this.statusMessage = "abort sent — agent stays alive";
 			this.tui.requestRender();
 			return;
 		}
-		if (data === "R") {
+		if (matchesKey(data, "shift+r")) {
 			this.statusMessage = "revive from session file is planned for a later phase";
 			this.tui.requestRender();
 			return;
 		}
-		// Any other printable character starts composing (type-to-talk).
-		if (data.length > 0 && !isControlSequence(data)) {
+		// Any other printable input starts composing (type-to-talk). Kitty
+		// CSI-u encodes plain keys as escape sequences, so accept either a
+		// decodable kitty sequence or a legacy printable byte (incl. CJK text).
+		if (decodeKittyPrintable(data) !== undefined || (data.length > 0 && !isControlSequence(data))) {
 			this.activateComposer("reply");
 			this.editor.handleInput(data);
 		}

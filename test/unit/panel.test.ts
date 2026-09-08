@@ -229,3 +229,29 @@ test("transcript pane mirrors tail output in view mode", async () => {
 	assert.ok(text.includes("第一行回答"), "assistant line 1");
 	assert.ok(text.includes("第二行回答"), "assistant line 2");
 });
+
+test("kitty keyboard protocol sequences drive the same actions; releases ignored", async () => {
+	const h = createPanelHarness();
+	// kitty n (CSI-u) opens the new-task composer
+	h.panel.handleInput("\x1b[110;1u");
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("new task:"), "kitty n activates composer");
+	// key-release of the same key must not double-fire anything
+	h.panel.handleInput("\x1b[110;1:3u");
+	// legacy esc still cancels
+	h.panel.handleInput("\x1b");
+	h.panel.invalidate();
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("n new task"), "composer cancelled");
+	// kitty space opens view + composer
+	const { handle } = await spawnAgent(h, "a");
+	h.panel.invalidate();
+	h.panel.handleInput("\x1b[32;1u");
+	assert.equal(h.focus.current, handle.id);
+	h.panel.invalidate();
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("enter send"), "kitty space focuses composer");
+	// kitty printable character flows into the editor (type-to-talk path)
+	h.panel.handleInput("\x1b[104;1u"); // h
+	h.panel.handleInput("\x1b[105;1u"); // i
+	h.panel.handleInput("\r");
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.deepEqual((h.sessions[0] as FakeRpcSession).sends.map((x) => x.text), ["hi"]);
+});

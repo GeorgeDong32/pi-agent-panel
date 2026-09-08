@@ -223,6 +223,16 @@ export class FleetSupervisor {
 - 键位（proposal §2.3 全表）：list `j/k ↑/↓` 选择 · `enter` 跳入 · `space` 跳入+聚焦 composer · `n` 新任务 composer（首行派生名字，enter = spawn+跳入）· `x` 打断当前轮 · `X`/`ctrl+x` 归档 · `p` pin · `esc/q` 关闭；view `enter/space` 聚焦 composer · `j/k` 逐行滚动 · `PgUp/PgDn` 翻页 · `x` 打断 · `←`/`esc` 返回列表 · `R` 预留 revive 提示。
 - crashed/archived agent 的 view：composer 禁用 + 提示 + session 文件路径（`R` 提示二期）。
 
+### D12（2026-09-08）takeover/detach —— enter 的语义升级为「主 REPL 接管会话」
+
+用户诉求「enter 打开的就是正常 pi」。源码实证：pi 在 ExtensionCommandContext 上提供 `switchSession(sessionPath, { withSession })`（interactive-mode 走 handleResumeSession → 完整会话重建 + UI 重建）。**模型：session 文件 = 会话的真相，进程只是临时的驱动器**：
+
+- **takeover（list 上 enter）**：panel done 回传 `{takeover: id}` → 命令层 `supervisor.takeover(id)`（停 rpc child，记录标 `attached`，不发 agent-final）→ `ctx.switchSession(child.sessionFile)` → 主 REPL 本尊 resume 该会话（完整 CC-TUI 皮肤/编辑器/命令）。失败回滚：switch 抛错则自动 detach 回去，会话不滞留。
+- **detach（attached 行上 d）**：`supervisor.detach(id)`（删旧记录、`spawn({resume: sessionFile})` 重生 rpc child——childDir/events.jsonl 原地复用，镜像连续）→ `ctx.switchSession(lastMainSessionFile)` 切回主会话。跳回目标链式记忆：session_start(new/resume/fork) 的 `previousSessionFile`。
+- **生命周期分化（关键坑）**：switchSession 的 teardownCurrent 会发 `session_shutdown`——原 handler 无条件 dispose 会杀掉整个 fleet。现按 reason 分化：仅 `quit`/`reload` 清理；`new`/`resume`/`fork` 保留 fleet 并重绑 ctx/pill。
+- **边界**：switchSession 只在命令 ctx 上（RegisteredCommand.handler），alt+p shortcut 的 ctx 无此方法 → takeover/detach 仅 `/agent-panel` 路径可用，shortcut 路径 notify 引导。takeover 后该 agent 由主 REPL 驱动，用主会话的模型配置（非 child 原模型）——与「驱动器可换」哲学一致。attached 不持久化（宿主重启后视为 archived， revived 属二期）。
+- ConversationView（space 快看）保留为轻观察层：不接管、纯渲染，与 takeover 分层。
+
 ### ConversationView（`extensions/lib/conversation.ts`）— 原生对话渲染
 
 - **动机（2026-09-08，用户实测「不能像 CC 那样跳到正常 session 界面」）**：对照 CC 源码（/Users/gd32/Coding/claude-code/src）实证其 agent panel 机制——没有独立 panel 组件，`REPL.tsx:4509` `displayedMessages = viewedAgentTask.messages`，同一个 `<Messages>` 渲染器换消息源；进入时 disk bootstrap（retain + 读盘合并去重），查看时输入框提交 = steer/续跑（`onAgentSubmit`）。pi 的 child 是独立 OS 进程、宿主 REPL 无消息源 seam，字面复刻不可行；但**渲染保真度**可行：view 直接用 pi 导出的同名组件画 child 的会话流。

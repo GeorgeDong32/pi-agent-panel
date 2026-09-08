@@ -24,16 +24,18 @@ function createPanelHarness() {
 	const renders: number[] = [];
 	const focus = { current: null as string | null };
 	let doneCalled = false;
+	let action: { takeover?: string; detach?: string } | undefined;
 	const panel = new FleetPanelComponent(
 		{ requestRender: () => renders.push(1), terminal: { rows: 30 } } as unknown as TUI,
 		fakeTheme,
 		supervisor,
-		() => {
+		(result) => {
 			doneCalled = true;
+			action = result;
 		},
 		{ cwd: "/tmp", focus },
 	);
-	return { panel, supervisor, sessions, focus, isDone: () => doneCalled, renderCount: () => renders.length };
+	return { panel, supervisor, sessions, focus, isDone: () => doneCalled, action: () => action, renderCount: () => renders.length };
 }
 
 async function spawnAgent(h: ReturnType<typeof createPanelHarness>, name: string): Promise<{ handle: AgentHandle; session: FakeRpcSession }> {
@@ -50,7 +52,9 @@ test("empty roster renders guidance, groups header and footer hints", () => {
 	const text = lines.join("\n");
 	assert.ok(text.includes("agent-panel"), "header present");
 	assert.ok(text.includes("No agents"), "empty-roster guidance present");
-	assert.ok(text.includes("n new task"), "footer hints present");
+	assert.ok(text.includes("n new"), "footer hints present");
+	assert.ok(text.includes("enter takeover"), "takeover hint present");
+	assert.ok(text.includes("d detach"), "detach hint present");
 	assert.ok(text.includes("esc close"), "esc hint present");
 	// Fullscreen contract: output spans the full terminal height (rows=30 in
 	// the stub) — short output would leave the host UI visible below.
@@ -99,26 +103,26 @@ test("j/k move selection; enter opens view; ← and esc return to list", async (
 	h.panel.invalidate();
 	assert.ok(h.panel.render(WIDTH).join("\n").includes("a"), "roster shows agents");
 	h.panel.handleInput("j");
-	h.panel.handleInput("\r"); // enter → view mode
+	h.panel.handleInput(" "); // space → quick-look view mode
 	h.panel.invalidate();
 	const viewText = h.panel.render(WIDTH).join("\n");
 	assert.ok(viewText.includes("b"), "view opened for second agent");
 	assert.ok(viewText.includes("back to list"), "view footer");
 	h.panel.handleInput("\x1b[D"); // left arrow
 	h.panel.invalidate();
-	assert.ok(h.panel.render(WIDTH).join("\n").includes("jk select"), "back in list mode");
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("enter takeover"), "back in list mode");
 	// And again into view, this time leaving via esc.
-	h.panel.handleInput("\r");
+	h.panel.handleInput(" ");
 	h.panel.handleInput("\x1b");
 	h.panel.invalidate();
-	assert.ok(h.panel.render(WIDTH).join("\n").includes("jk select"), "esc returns to list from view");
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("enter takeover"), "esc returns to list from view");
 });
 
 test("view focus channel tracks the viewed agent for suppression", async () => {
 	const h = createPanelHarness();
 	const { handle } = await spawnAgent(h, "a");
 	h.panel.invalidate();
-	h.panel.handleInput("\r");
+	h.panel.handleInput(" ");
 	assert.equal(h.focus.current, handle.id);
 	h.panel.handleInput("\x1b[D");
 	assert.equal(h.focus.current, null);
@@ -140,7 +144,7 @@ test("composer: n → CJK task → enter spawns with derived name, stays in list
 	h.panel.invalidate();
 	const text = h.panel.render(WIDTH).join("\n");
 	assert.ok(text.includes("started '调查缓存问题'"), "started hint");
-	assert.ok(text.includes("jk select"), "still in list mode");
+	assert.ok(text.includes("enter takeover"), "still in list mode");
 	assert.equal(h.focus.current, null);
 });
 
@@ -159,21 +163,21 @@ test("view mode: ← on an empty composer returns to the list without esc", asyn
 	const h = createPanelHarness();
 	const { handle } = await spawnAgent(h, "a");
 	h.panel.invalidate();
-	h.panel.handleInput("\r"); // enter → view + composer focused
+	h.panel.handleInput(" "); // space → quick-look view
 	assert.equal(h.focus.current, handle.id);
 	h.panel.handleInput("\x1b[D"); // ← with an empty draft → back to list
 	h.panel.invalidate();
 	assert.equal(h.focus.current, null);
-	assert.ok(h.panel.render(WIDTH).join("\n").includes("jk select"), "back in list");
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("enter takeover"), "back in list");
 	// With text in the draft, ← moves the cursor instead of leaving.
-	h.panel.handleInput(" "); // space → view + composer focused
+	h.panel.handleInput(" "); // space → view again
 	h.panel.handleInput("d");
 	h.panel.handleInput("r");
 	h.panel.handleInput("\x1b[D"); // ← over a non-empty draft
 	h.panel.invalidate();
 	const still = h.panel.render(WIDTH).join("\n");
 	assert.ok(still.includes("enter send"), "still composing in view");
-	assert.ok(!still.includes("jk select"), "did not leave the view");
+	assert.ok(!still.includes("enter takeover"), "did not leave the view");
 });
 
 test("composer reply in view: submit prompts with panel origin; esc cancels draft", async () => {
@@ -242,8 +246,8 @@ test("view of a crashed agent: composer refuses with a hint", async () => {
 	const crashed = h.supervisor.list().find((a) => a.id === handle.id) as AgentHandle;
 	crashed.state = "crashed";
 	h.panel.invalidate();
-	h.panel.handleInput("\r"); // open view (archived/crashed group row)
-	h.panel.handleInput(" "); // try to focus composer
+	h.panel.handleInput(" "); // open view (archived/crashed group row)
+	h.panel.handleInput("r"); // try to compose via type-to-talk
 	h.panel.invalidate();
 	const text = h.panel.render(WIDTH).join("\n");
 	assert.ok(text.includes("not running"), "composer disabled hint");
@@ -260,7 +264,7 @@ test("view mode renders a native conversation (bubbles + tool card)", async () =
 	// The events mirror flushes asynchronously; wait for it before reading.
 	await new Promise((resolve) => setTimeout(resolve, 60));
 	h.panel.invalidate();
-	h.panel.handleInput("\r");
+	h.panel.handleInput(" ");
 	h.panel.invalidate();
 	const text = h.panel.render(WIDTH).join("\n");
 	assert.ok(text.includes("task text"), "user bubble text");
@@ -280,18 +284,40 @@ test("kitty keyboard protocol sequences drive the same actions; releases ignored
 	// legacy esc still cancels
 	h.panel.handleInput("\x1b");
 	h.panel.invalidate();
-	assert.ok(h.panel.render(WIDTH).join("\n").includes("n new task"), "composer cancelled");
-	// kitty space opens view + composer
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("n new"), "composer cancelled");
+	// kitty space opens the quick-look view
 	const { handle } = await spawnAgent(h, "a");
 	h.panel.invalidate();
 	h.panel.handleInput("\x1b[32;1u");
 	assert.equal(h.focus.current, handle.id);
 	h.panel.invalidate();
-	assert.ok(h.panel.render(WIDTH).join("\n").includes("enter send"), "kitty space focuses composer");
+	assert.ok(h.panel.render(WIDTH).join("\n").includes("back to list"), "kitty space opens view");
 	// kitty printable character flows into the editor (type-to-talk path)
 	h.panel.handleInput("\x1b[104;1u"); // h
 	h.panel.handleInput("\x1b[105;1u"); // i
 	h.panel.handleInput("\r");
 	await new Promise((resolve) => setTimeout(resolve, 50));
 	assert.deepEqual((h.sessions[0] as FakeRpcSession).sends.map((x) => x.text), ["hi"]);
+});
+
+
+test("enter on a live agent requests takeover; d on an attached agent requests detach", async () => {
+	// takeover: enter closes the panel and reports the agent id upward.
+	const h = createPanelHarness();
+	const { handle } = await spawnAgent(h, "a");
+	h.panel.invalidate();
+	h.panel.handleInput("\r");
+	assert.equal(h.isDone(), true, "panel closed for takeover");
+	assert.deepEqual(h.action(), { takeover: handle.id });
+
+	// detach: takeover first, then d on the attached row.
+	const h2 = createPanelHarness();
+	const { handle: b } = await spawnAgent(h2, "b");
+	await h2.supervisor.takeover(b.id);
+	h2.panel.invalidate();
+	const text = h2.panel.render(WIDTH).join("\n");
+	assert.ok(text.includes("Attached"), "attached group appears");
+	assert.ok(text.includes("⇄"), "attached glyph");
+	h2.panel.handleInput("d");
+	assert.deepEqual(h2.action(), { detach: b.id });
 });

@@ -115,7 +115,9 @@ export class FleetSupervisor {
 	}
 
 	/** Create a live rpc child. Resolves once the session is started and its
-	 *  initial state aligned; the optional first prompt is sent as background. */
+	 *  initial state aligned; the optional first prompt is sent as background.
+	 *  `spec.resume` re-adopts an existing child session file (detach flow):
+	 *  the child directory and events mirror are the original ones. */
 	async spawn(spec: AgentSpec & { prompt?: string }): Promise<AgentHandle> {
 		if (this.disposed) throw new Error("FleetSupervisor is disposed");
 		if (!spec.name.trim()) throw new Error("Agent name must be non-empty");
@@ -128,19 +130,25 @@ export class FleetSupervisor {
 		);
 		if (nameTaken) throw new Error(`A live agent named '${spec.name}' already exists`);
 
-		const id = `${sanitizeSegment(spec.name)}-${this.now().toString(36)}-${createHash("sha1")
+		const resumedDir = spec.resume ? path.dirname(spec.resume) : undefined;
+		const id = resumedDir ? path.basename(resumedDir) : `${sanitizeSegment(spec.name)}-${this.now().toString(36)}-${createHash("sha1")
 			.update(`${spec.name}:${this.now()}:${Math.random()}`)
 			.digest("hex")
 			.slice(0, 6)}`;
-		const childDir = path.join(this.rootDir, id);
+		if (this.children.has(id)) throw new Error(`Agent '${id}' is already supervised`);
+		const childDir = resumedDir ?? path.join(this.rootDir, id);
 		fs.mkdirSync(childDir, { recursive: true });
-		const sessionFile = path.join(childDir, "session.jsonl");
+		const sessionFile = spec.resume ?? path.join(childDir, "session.jsonl");
 		const eventsFile = path.join(childDir, "events.jsonl");
+		// createWriteStream opens lazily: touch the file so takeover/detach on
+		// a never-emitting child still leaves a readable mirror behind.
+		fs.closeSync(fs.openSync(eventsFile, "a"));
 
 		const handle: AgentHandle = {
 			id,
 			name: spec.name,
 			state: "starting",
+			cwd: spec.cwd,
 			startedAt: this.now(),
 			tokens: { input: 0, output: 0, cost: 0 },
 			toolCount: 0,
@@ -265,6 +273,52 @@ export class FleetSupervisor {
 		record.handle.pinned = pinned ?? !record.handle.pinned;
 		this.emit({ type: "agent-updated", handle: this.snapshot(record.handle) });
 		return true;
+	}
+
+	/**
+	 * Takeover: stop the child's rpc process and hand its session file to the
+	 * main REPL (ctx.switchSession in the command layer). The record stays in
+	 * the pool flagged `attached` so the panel can list it and detach later.
+	 * Unlike archive this does not emit agent-final — nothing crashed; the
+	 * conversation moved to a driver the user is looking at.
+	 */
+	async takeover(id: string): Promise<AgentHandle | null> {
+		const record = this.children.get(id);
+		if (!record || !isLive(record.handle)) return null;
+		this.clearProbe(record);
+		record.unsubscribeEvents();
+		record.handle.state = "archived";
+		record.handle.attached = true;
+		record.handle.endedAt = this.now();
+		record.handle.currentTool = undefined;
+		this.archivedIds.add(id);
+		this.persistArchivedIds();
+		record.eventsStream.end();
+		try {
+			await record.session.stop();
+		} catch {
+			// The kill chain escalates internally; a rejected stop still killed.
+		}
+		this.emit({ type: "agent-updated", handle: this.snapshot(record.handle) });
+		return this.snapshot(record.handle);
+	}
+
+	/**
+	 * Detach: hand an attached conversation back to background supervision by
+	 * respawning an rpc child on the same session file (events mirror is
+	 * appended in place, so the view's history stays continuous).
+	 */
+	async detach(id: string): Promise<AgentHandle | null> {
+		const record = this.children.get(id);
+		if (!record || !record.handle.attached) return null;
+		const { name, cwd, sessionFile } = record.handle;
+		this.clearProbe(record);
+		record.unsubscribeEvents();
+		record.eventsStream.end();
+		this.children.delete(id);
+		this.archivedIds.delete(id);
+		this.persistArchivedIds();
+		return this.spawn({ name, cwd, resume: sessionFile });
 	}
 
 	list(): AgentHandle[] {

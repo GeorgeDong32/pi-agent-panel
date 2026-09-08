@@ -3,11 +3,11 @@
  * processes, no network — everything below drives the seam.
  */
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import { createHarness, emitTurn, FakeRpcSession, waitFor } from "./fake-rpc.ts";
 import { groupOf } from "../../extensions/lib/supervisor.ts";
-import type { SupervisorEvent } from "../../extensions/lib/types.ts";
+import type { AgentHandle, SupervisorEvent } from "../../extensions/lib/types.ts";
 
 test("spawn starts a session, aligns to awaiting-input, emits agent-added", async () => {
 	const { supervisor, sessions } = createHarness();
@@ -267,4 +267,40 @@ test("groupOf maps states to the three roster groups", () => {
 	assert.equal(groupOf("awaiting-input"), "awaiting-input");
 	assert.equal(groupOf("archived"), "archived");
 	assert.equal(groupOf("crashed"), "archived");
+});
+
+test("takeover stops the child, flags attached, keeps the record detachable", async () => {
+	const { supervisor, sessions } = createHarness();
+	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	const session = sessions[0] as FakeRpcSession;
+	const taken = await supervisor.takeover(handle.id);
+	assert.ok(taken, "takeover resolves with the handle");
+	assert.equal(taken?.attached, true);
+	assert.equal(taken?.state, "archived");
+	assert.equal(session.stopCalls, 1, "rpc child stopped");
+	// Still listed (attached group), no crash notification path.
+	const listed = supervisor.list().find((a) => a.id === handle.id) as AgentHandle;
+	assert.equal(listed.attached, true);
+	// Live-agent guard: takeover twice fails cleanly.
+	assert.equal(await supervisor.takeover(handle.id), null);
+});
+
+test("detach respawns supervision on the same session file and directory", async () => {
+	const { supervisor, sessions } = createHarness();
+	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
+	const originalFile = handle.sessionFile;
+	const originalEvents = handle.eventsFile;
+	await supervisor.takeover(handle.id);
+	const detached = await supervisor.detach(handle.id);
+	assert.ok(detached, "detach respawns the agent");
+	assert.equal(detached?.id, handle.id, "same id (same child dir)");
+	assert.equal(detached?.sessionFile, originalFile, "same session file resumed");
+	assert.equal(detached?.attached, undefined);
+	assert.equal(detached?.state, "awaiting-input");
+	const resumed = sessions[sessions.length - 1] as FakeRpcSession;
+	assert.equal(resumed.createdOptions.sessionFile, originalFile, "factory received the original file");
+	// Events mirror keeps appending in place, so view history stays continuous.
+	assert.ok(existsSync(originalEvents), "events mirror file exists in place");
+	// The new record is live again; takeover after detach works (full cycle).
+	assert.ok(await supervisor.takeover(detached.id));
 });

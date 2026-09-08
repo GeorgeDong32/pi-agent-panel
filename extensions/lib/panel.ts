@@ -38,7 +38,7 @@ function statusGlyph(handle: AgentHandle, theme: PanelTheme): string {
 		case "awaiting-input":
 			return theme.fg("success", "✓");
 		case "archived":
-			return theme.fg("dim", "✗");
+			return handle.attached ? theme.fg("accent", "⇄") : theme.fg("dim", "✗");
 		default:
 			return theme.fg("error", "✗");
 	}
@@ -61,6 +61,15 @@ export function deriveTaskName(task: string): string {
 	const firstLine = task.split("\n").map((l) => l.trim()).find(Boolean) ?? "task";
 	const collapsed = firstLine.replace(/\s+/g, " ");
 	return collapsed.length > NEW_TASK_NAME_LIMIT ? `${collapsed.slice(0, NEW_TASK_NAME_LIMIT)}…` : collapsed;
+}
+
+/** What the panel asks the command layer to do (ctx-dependent, so the
+ *  component itself never touches ctx). */
+export interface PanelAction {
+	/** Hand this agent's session to the main REPL (switchSession). */
+	takeover?: string;
+	/** Give an attached conversation back to background supervision. */
+	detach?: string;
 }
 
 export interface PanelDeps {
@@ -96,13 +105,13 @@ export class FleetPanelComponent {
 	private readonly theme: PanelTheme;
 	private readonly supervisor: FleetSupervisor;
 	private readonly deps: PanelDeps;
-	private readonly done: (result: undefined) => void;
+	private readonly done: (result: PanelAction | undefined) => void;
 
 	constructor(
 		tui: TUI | { requestRender(force?: boolean): void; terminal?: { rows?: number } },
 		theme: PanelTheme,
 		supervisor: FleetSupervisor,
-		done: (result: undefined) => void,
+		done: (result: PanelAction | undefined) => void,
 		deps: PanelDeps,
 	) {
 		this.tui = tui;
@@ -164,13 +173,16 @@ export class FleetPanelComponent {
 		}
 	}
 
-	/** Flattened, ordered roster: Pinned first, then Working / Awaiting / Archived. */
+	/** Flattened, ordered roster: Attached (owned by main REPL) first, then
+	 *  Pinned / Working / Awaiting / Archived. */
 	private rebuildRows(): void {
-		const rows: Array<{ handle: AgentHandle; group: "pinned" | "working" | "awaiting-input" | "archived" }> = [];
-		const pinned = this.items.filter((h) => h.pinned && h.state !== "archived" && h.state !== "crashed");
-		const working = this.items.filter((h) => !h.pinned && (h.state === "working" || h.state === "starting"));
-		const awaiting = this.items.filter((h) => !h.pinned && h.state === "awaiting-input");
-		const archived = this.items.filter((h) => h.state === "archived" || h.state === "crashed");
+		const rows: Array<{ handle: AgentHandle; group: "attached" | "pinned" | "working" | "awaiting-input" | "archived" }> = [];
+		const attached = this.items.filter((h) => h.attached);
+		const pinned = this.items.filter((h) => h.pinned && !h.attached && h.state !== "archived" && h.state !== "crashed");
+		const working = this.items.filter((h) => !h.pinned && !h.attached && (h.state === "working" || h.state === "starting"));
+		const awaiting = this.items.filter((h) => !h.pinned && !h.attached && h.state === "awaiting-input");
+		const archived = this.items.filter((h) => !h.attached && (h.state === "archived" || h.state === "crashed"));
+		for (const handle of attached) rows.push({ handle, group: "attached" });
 		for (const handle of pinned) rows.push({ handle, group: "pinned" });
 		for (const handle of working) rows.push({ handle, group: "working" });
 		for (const handle of awaiting) rows.push({ handle, group: "awaiting-input" });
@@ -219,11 +231,14 @@ export class FleetPanelComponent {
 		if (matchesKey(data, "down") || matchesKey(data, "j")) return this.moveSelection(1);
 		if (matchesKey(data, "home")) return this.moveSelection(-this.rows.length);
 		if (matchesKey(data, "end")) return this.moveSelection(this.rows.length);
-		if (matchesKey(data, "enter")) return this.openSelected(false);
-		if (matchesKey(data, "space")) return this.openSelected(true);
+		// enter = takeover: the main REPL adopts the agent's session (a real,
+		// full-skin pi). space = quick look inside the panel instead.
+		if (matchesKey(data, "enter")) return this.requestTakeover();
+		if (matchesKey(data, "space")) return this.openSelected();
 		if (matchesKey(data, "n")) return this.activateComposer("new-task");
 		if (matchesKey(data, "x")) return this.abortSelected();
 		if (matchesKey(data, "shift+x") || matchesKey(data, "ctrl+x")) return this.archiveSelected();
+		if (matchesKey(data, "d")) return this.requestDetach();
 		if (matchesKey(data, "p")) {
 			const handle = this.rows[this.selected]?.handle;
 			if (handle) this.supervisor.pin(handle.id);
@@ -233,7 +248,9 @@ export class FleetPanelComponent {
 		}
 		// Any other printable input starts a new task directly (type-to-talk);
 		// kitty CSI-u sequences and legacy bytes (incl. IME CJK) both count.
-		if (decodeKittyPrintable(data) !== undefined || (data.length > 0 && !isControlSequence(data))) {
+		// '/' is excluded: it starts slash commands, which belong to the main
+		// REPL — swallowing it here would spawn literal "/..." task names.
+		if (data !== "/" && (decodeKittyPrintable(data) !== undefined || (data.length > 0 && !isControlSequence(data)))) {
 			this.activateComposer("new-task");
 			this.editor.handleInput(data);
 		}
@@ -271,7 +288,8 @@ export class FleetPanelComponent {
 		// Any other printable input starts composing (type-to-talk). Kitty
 		// CSI-u encodes plain keys as escape sequences, so accept either a
 		// decodable kitty sequence or a legacy printable byte (incl. CJK text).
-		if (decodeKittyPrintable(data) !== undefined || (data.length > 0 && !isControlSequence(data))) {
+		// '/' is reserved for slash commands (see handleListInput).
+		if (data !== "/" && (decodeKittyPrintable(data) !== undefined || (data.length > 0 && !isControlSequence(data)))) {
 			this.activateComposer("reply");
 			this.editor.handleInput(data);
 		}
@@ -288,11 +306,10 @@ export class FleetPanelComponent {
 		this.tui.requestRender();
 	}
 
-	private openSelected(focusComposer: boolean): void {
+	private openSelected(): void {
 		const handle = this.rows[this.selected]?.handle;
 		if (!handle) return;
 		this.enterView(handle.id);
-		if (focusComposer) this.activateComposer("reply");
 		this.refresh();
 		this.tui.requestRender();
 	}
@@ -400,6 +417,22 @@ export class FleetPanelComponent {
 		this.tui.requestRender();
 	}
 
+	/** enter on a live agent: close the panel and let the command layer stop
+	 *  the rpc child and switch the main REPL onto its session file. */
+	private requestTakeover(): void {
+		const handle = this.rows[this.selected]?.handle;
+		if (!handle || !isLiveHandle(handle)) return;
+		this.done({ takeover: handle.id });
+	}
+
+	/** d on an attached agent: respawn an rpc child on its session file and
+	 *  let the command layer switch the main REPL back to its own session. */
+	private requestDetach(): void {
+		const handle = this.rows[this.selected]?.handle;
+		if (!handle?.attached) return;
+		this.done({ detach: handle.id });
+	}
+
 	private archiveSelected(): void {
 		const handle = this.rows[this.selected]?.handle;
 		if (!handle || handle.state === "archived") return;
@@ -497,6 +530,7 @@ export class FleetPanelComponent {
 
 	private groupLabel(group: string): string {
 		const labels: Record<string, string> = {
+			attached: "Attached (in main REPL — d to detach)",
 			pinned: "Pinned",
 			working: "Working",
 			"awaiting-input": "Awaiting input",
@@ -528,7 +562,9 @@ export class FleetPanelComponent {
 	private viewBody(width: number, height: number): string[] {
 		const handle = this.items.find((item) => item.id === this.viewId);
 		const lines: string[] = [];
-		if (handle && (handle.state === "crashed" || handle.state === "archived")) {
+		if (handle?.attached) {
+			lines.push(this.theme.fg("accent", "attached — this conversation is driven by the main REPL right now (d in the list to detach)"));
+		} else if (handle && (handle.state === "crashed" || handle.state === "archived")) {
 			lines.push(this.theme.fg("error", `agent ${handle.state === "crashed" ? "crashed" : "archived"} — composer disabled, session file: ${handle.sessionFile}`));
 		}
 		if (this.statusMessage) lines.push(this.theme.fg("warning", this.statusMessage));
@@ -560,9 +596,9 @@ export class FleetPanelComponent {
 				: "enter send · esc cancel composer · (agent working → sends as steer)";
 		}
 		if (this.mode === "view") {
-			return "enter/space reply · jk scroll · PgUp/PgDn page · x abort turn · ←/esc back to list";
+			return "space/enter reply · jk scroll · PgUp/PgDn page · x abort turn · ←/esc back to list";
 		}
-		return "jk select · enter open · space reply · n new task · x abort · X archive · p pin · esc close";
+		return "enter takeover · space look · jk · n new · x abort · X archive · d detach · p pin · esc close";
 	}
 
 	invalidate(): void {
@@ -582,16 +618,21 @@ function isControlSequence(data: string): boolean {
 	return data.charCodeAt(0) === 0x1b || data.charCodeAt(0) < 0x20 || data.charCodeAt(0) === 0x7f;
 }
 
+/** Live = has a running rpc child behind it (takeover-eligible). */
+function isLiveHandle(handle: AgentHandle): boolean {
+	return handle.state !== "archived" && handle.state !== "crashed";
+}
+
 export async function openFleetPanel(
-	ctx: import("@earendil-works/pi-coding-agent").ExtensionContext,
+	ctx: import("@earendil-works/pi-coding-agent").ExtensionCommandContext,
 	supervisor: FleetSupervisor,
 	focus: { current: string | null },
 	deps: { cwd?: string; model?: string } = {},
-): Promise<void> {
+): Promise<PanelAction | undefined> {
 	// Model forwarding (proposal §4.5): the child starts on whatever the main
 	// session currently uses; one-shot at spawn, later switches are the child's own.
 	const model = ctx.model?.id ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-	await ctx.ui.custom<undefined>(
+	const action = await ctx.ui.custom<PanelAction | undefined>(
 		(tui, theme, _keybindings, done) =>
 			new FleetPanelComponent(tui, theme, supervisor, done, {
 				cwd: deps.cwd ?? ctx.cwd,
@@ -606,4 +647,5 @@ export async function openFleetPanel(
 	);
 	// Panel closed: nothing is being viewed anymore.
 	focus.current = null;
+	return action;
 }

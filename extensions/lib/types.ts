@@ -13,6 +13,9 @@ export interface AgentSpec {
 	cwd: string;
 	/** Forwarded as --model (e.g. "anthropic/claude-..."). */
 	model?: string;
+	/** Resume an existing child session file instead of creating a new one
+	 *  (detach: hand an attached conversation back to background supervision). */
+	resume?: string;
 }
 
 /**
@@ -35,6 +38,8 @@ export interface AgentHandle {
 	id: string;
 	name: string;
 	state: AgentState;
+	/** Child's working directory (spawn/resume anchor). */
+	cwd: string;
 	startedAt: number;
 	/** Set when the process left the pool (crash or archive). */
 	endedAt?: number;
@@ -56,6 +61,8 @@ export interface AgentHandle {
 	/** Queued steer/follow-up messages inside the child (from getState). */
 	pendingCount: number;
 	pinned: boolean;
+	/** Session currently owned by the main REPL (takeover); child is stopped. */
+	attached?: boolean;
 }
 
 export type SupervisorEvent =

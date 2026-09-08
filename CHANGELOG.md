@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased (2026-09-08, evening)
+
+- **Takeover/detach — `enter` now opens the agent as a real, full-skin pi
+  session** (user feedback: "can't jump into a normal session like CC").
+  The model: the session file is the source of truth, processes are just
+  temporary drivers. `enter` stops the child's rpc process and switches the
+  main REPL onto the agent's session file via `ctx.switchSession` — your
+  skin, your editor, every command. `d` on an **Attached** row respawns
+  background supervision on the same session file and switches you back.
+  The fleet survives session switches (`session_shutdown` now only tears
+  down on quit/reload); takeover/detach require the command context, so
+  they work via `/agent-panel`, not `alt+p`. `space` keeps the in-panel
+  quick look (native message components).
+
 ## Unreleased fixes (2026-09-08, post-0.2.0)
 
 - **Silent notifications (user feedback: "duplicate notification cards")**:

@@ -39,8 +39,9 @@ pi -e ./path/to/pi-agent-panel/extensions
 | Key | List mode | View mode |
 |---|---|---|
 | `j/k` `↑/↓` | move selection | scroll transcript line by line |
-| `enter` | jump into agent | focus composer |
-| `space` | jump in + focus composer | focus composer |
+| `enter` | **takeover**: the main REPL adopts the agent's session (a real, full-skin pi) — `/agent-panel` only | focus composer |
+| `space` | quick look: open the in-panel conversation view | focus composer |
+| `d` | detach an attached agent: respawn background supervision, main REPL switches back | — |
 | type any character | starts a new-task composer (type-to-talk) | starts composing (type-to-talk) |
 | `n` | new-task composer (same as typing directly) | — |
 | `x` | abort current turn of selected agent (rpc abort, agent stays alive) | abort current turn |
@@ -56,7 +57,8 @@ The panel composer is a real pi-tui `Editor`: CJK/IME input, multi-line, termina
 
 1. `pi -e ./extensions` → `/agent-panel` (or `alt+p`) — the panel covers the whole terminal, header shows `0 working · 0 awaiting input · 0 archived`.
 2. Just start typing a Chinese task (e.g. `用一句话解释缓存失效`) — the new-task composer opens directly — then press `enter`. The agent spawns, the list stays put with the new agent selected (`started '…' — enter to open`).
-3. Press `enter` on the selected agent to jump into its conversation — rendered with pi's native message components (markdown bubbles, tool cards), grown live as events arrive. When the turn ends the header flips to `awaiting-input`; press `←` (empty composer) to return to the list.
+3. Press `space` on the selected agent for the in-panel quick look — pi's native message components (markdown bubbles, tool cards), grown live as events arrive. When the turn ends the header flips to `awaiting-input`; press `←` (empty composer) to return to the list.
+4. Press `enter` instead to **take over**: the panel closes, the child's rpc process stops, and the main REPL resumes the agent's session file — a complete pi with your skin, editor, and every command. The agent shows up under **Attached** in the panel; open `/agent-panel` and press `d` on it to detach (background supervision resumes on the same session file, and you switch back to your own session). Takeover/detach need the command context, so they work via `/agent-panel`, not `alt+p`.
 4. Type a follow-up question in the composer and press `enter` — a **second turn on the same child** (real conversation, context preserved).
 5. Press `←` to return to the list. Start a long task (`n` → `用 bash 执行 sleep 60 并等待`), jump in, press `x` — the turn aborts, the agent survives, you can keep asking.
 6. Press `X` on an agent — it moves to `Archived`, the process is gone, and `~/.pi/agent/agent-panel/<id>/session.jsonl` remains (`pi --session <file>` reopens it).

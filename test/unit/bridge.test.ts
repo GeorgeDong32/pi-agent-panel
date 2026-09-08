@@ -13,6 +13,7 @@ function baseHandle(overrides: Partial<AgentHandle> = {}): AgentHandle {
 		id: "agent-1",
 		name: "alpha",
 		state: "awaiting-input",
+		cwd: "/tmp",
 		startedAt: 1_000,
 		tokens: { input: 12, output: 6, cost: 0.01 },
 		toolCount: 2,

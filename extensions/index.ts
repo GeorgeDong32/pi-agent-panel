@@ -171,29 +171,36 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 		}
 	};
 
+	/** Shared panel entry for shortcut contexts (alt+p, shift+left). switchSession
+	 *  lives on the command context only, so takeover/detach selected here ask
+	 *  the user to rerun /agent-panel — every other panel action works. */
+	const openPanelViaShortcut = async (ctx: ExtensionContext): Promise<void> => {
+		if (panelOpen) return;
+		panelOpen = true;
+		try {
+			const action = await openFleetPanel(
+				ctx as ExtensionCommandContext,
+				ensureCore().supervisor,
+				ensureCore().focus,
+			);
+			if (action?.takeover || action?.detach) {
+				ctx.ui.notify("agent-panel: takeover/detach needs the command context — run /agent-panel and press enter/d there", "warning");
+			}
+		} catch {
+			// e.g. runtime missing in odd modes; the command path reports details.
+		} finally {
+			panelOpen = false;
+		}
+	};
+
 	pi.registerShortcut("alt+p", {
 		description: "Toggle the agent fleet panel",
-		handler: async (ctx: ExtensionContext) => {
-			if (panelOpen) return;
-			panelOpen = true;
-			try {
-				const action = await openFleetPanel(
-					ctx as ExtensionCommandContext,
-					ensureCore().supervisor,
-					ensureCore().focus,
-				);
-				// switchSession lives on the command context only, so takeover/
-				// detach are offered through /agent-panel; the shortcut path
-				// explains the detour instead of failing silently.
-				if (action?.takeover || action?.detach) {
-					ctx.ui.notify("agent-panel: takeover/detach needs the command context — run /agent-panel and press enter/d there", "warning");
-				}
-			} catch {
-				// e.g. runtime missing in odd modes; the command path reports details.
-			} finally {
-				panelOpen = false;
-			}
-		},
+		handler: openPanelViaShortcut,
+	});
+
+	pi.registerShortcut("shift+left", {
+		description: "Open the agent fleet panel (CC's ← for agents)",
+		handler: openPanelViaShortcut,
 	});
 
 	pi.on("session_start", (event, ctx) => {

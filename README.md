@@ -31,8 +31,15 @@ pi -e ./path/to/pi-agent-panel/extensions
 /agent-panel spawn <name> <prompt...>   # start a background task (long-lived rpc child)
 /agent-panel archive <name|id>          # archive: kill + hide, session JSONL kept
 /agent-panel stop <name|id>             # alias of archive (v0.1 compat)
-/agent-panel                            # open the fullscreen panel (or alt+p)
+/agent-panel                            # open the fullscreen panel (or alt+p / shift+left)
 ```
+
+> **Shift+Left** opens the panel from anywhere — including right after a
+> takeover, from inside the attached agent's own session (CC's "← for
+> agents", adapted: bare `←` stays reserved for cursor movement because pi
+> shortcuts have no "empty input" condition). Takeover/detach picked from a
+> shortcut-opened panel ask you to rerun `/agent-panel`; everything else
+> works there.
 
 ### Keys
 

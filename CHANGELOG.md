@@ -2,6 +2,15 @@
 
 ## Unreleased (2026-09-08, evening)
 
+- **Shift+Left opens the panel from anywhere** (user feedback: "can I use
+  the left arrow to get back to the panels?"). pi's extension shortcuts run
+  before editor input with no "empty input" condition, so bare `←` would
+  eat cursor movement; `shift+left` is unbound everywhere and reaches the
+  shortcut bridge even under custom editors (CC-TUI skin) — verified in
+  pty with two open/close cycles. Takeover/detach via this path still ask
+  for `/agent-panel` (command context only).
+
+
 - **Takeover/detach — `enter` now opens the agent as a real, full-skin pi
   session** (user feedback: "can't jump into a normal session like CC").
   The model: the session file is the source of truth, processes are just

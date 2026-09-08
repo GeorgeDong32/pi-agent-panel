@@ -203,6 +203,24 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 		handler: openPanelViaShortcut,
 	});
 
+	// CC's exact "← for agents": only when the input is empty. pi shortcuts
+	// match before editor input and have no empty-input condition, so the
+	// handler checks the draft itself; with a non-empty draft it stays hands-
+	// off (ctrl+b remains the cursor-left equivalent, a pi default binding).
+	pi.registerShortcut("left", {
+		description: "Open the agent fleet panel when the input is empty",
+		handler: async (ctx: ExtensionContext) => {
+			let draft = "";
+			try {
+				draft = ctx.ui.getEditorText();
+			} catch {
+				return; // no readable editor in this context; stay hands-off
+			}
+			if (draft.length > 0) return;
+			await openPanelViaShortcut(ctx);
+		},
+	});
+
 	pi.on("session_start", (event, ctx) => {
 		// Rebuild per-session bindings; the fleet (core) persists across this.
 		core.session?.unsubscribePillEvents();

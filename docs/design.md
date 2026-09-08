@@ -232,7 +232,7 @@ export class FleetSupervisor {
 - **生命周期分化（关键坑）**：switchSession 的 teardownCurrent 会发 `session_shutdown`——原 handler 无条件 dispose 会杀掉整个 fleet。现按 reason 分化：仅 `quit`/`reload` 清理；`new`/`resume`/`fork` 保留 fleet 并重绑 ctx/pill。
 - **边界**：switchSession 只在命令 ctx 上（RegisteredCommand.handler），alt+p shortcut 的 ctx 无此方法 → takeover/detach 仅 `/agent-panel` 路径可用，shortcut 路径 notify 引导。takeover 后该 agent 由主 REPL 驱动，用主会话的模型配置（非 child 原模型）——与「驱动器可换」哲学一致。attached 不持久化（宿主重启后视为 archived， revived 属二期）。
 - ConversationView（space 快看）保留为轻观察层：不接管、纯渲染，与 takeover 分层。
-- **入口补充（2026-09-08）**：`registerShortcut("shift+left")` 任意会话（含 takeover 后的 agent session）打开 panel——CC「← for agents」的适配版。裸 `←` 不可行：extension shortcut 在编辑器 handleInput 最前匹配且无「输入为空」条件（CC 有 Footer 上下文），会废掉光标移动；alt+left/ctrl+left 被 `tui.editor.cursorWordLeft` 占用；shift+left 全空且 custom editor（CC-TUI fork）桥接 `onExtensionShortcut`（interactive-mode 2117）。shortcut 路径打开的 panel 里 takeover/detach 仍降级提示（switchSession 仅命令 ctx）。
+- **入口补充（2026-09-08）**：`registerShortcut("left")` + handler 内 `ctx.ui.getEditorText()` 判空——空框开 panel（CC「← for agents」原味语义，getEditorText 跟随活编辑器、fork 皮肤下亦然）；非空放行（ctrl+b 是 pi 默认光标左移等价键）。`registerShortcut("shift+left")` 无条件打开作为冗余入口。裸 `←` 不可行：extension shortcut 在编辑器 handleInput 最前匹配且无「输入为空」条件（CC 有 Footer 上下文），会废掉光标移动；alt+left/ctrl+left 被 `tui.editor.cursorWordLeft` 占用；shift+left 全空且 custom editor（CC-TUI fork）桥接 `onExtensionShortcut`（interactive-mode 2117）。shortcut 路径打开的 panel 里 takeover/detach 仍降级提示（switchSession 仅命令 ctx）。
 
 ### ConversationView（`extensions/lib/conversation.ts`）— 原生对话渲染
 

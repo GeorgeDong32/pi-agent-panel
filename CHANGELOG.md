@@ -2,6 +2,12 @@
 
 ## Unreleased (2026-09-08, evening)
 
+- **Bare `←` now opens the panel on an empty input** — CC's exact "← for
+  agents" semantics. pi shortcuts have no empty-input condition, but the
+  handler can read the draft (`ctx.ui.getEditorText()`, which follows the
+  active editor even under custom skins): empty → panel; non-empty →
+  hands-off (`ctrl+b` stays the cursor-left move). pty-verified: empty ←
+  opens, `abc` + ← does not open and keeps the draft.
 - **Shift+Left opens the panel from anywhere** (user feedback: "can I use
   the left arrow to get back to the panels?"). pi's extension shortcuts run
   before editor input with no "empty input" condition, so bare `←` would

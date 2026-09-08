@@ -34,12 +34,13 @@ pi -e ./path/to/pi-agent-panel/extensions
 /agent-panel                            # open the fullscreen panel (or alt+p / shift+left)
 ```
 
-> **Shift+Left** opens the panel from anywhere — including right after a
-> takeover, from inside the attached agent's own session (CC's "← for
-> agents", adapted: bare `←` stays reserved for cursor movement because pi
-> shortcuts have no "empty input" condition). Takeover/detach picked from a
-> shortcut-opened panel ask you to rerun `/agent-panel`; everything else
-> works there.
+> **←** opens the panel when the input is empty — CC's exact "← for
+> agents", including right after a takeover, from inside the attached
+> agent's own session. With a non-empty draft, `←` stays hands-off and
+> `ctrl+b` remains the cursor-left move (a pi default binding); take care
+> in editors that rebind it. **Shift+Left** opens the panel regardless of
+> the draft. Takeover/detach picked from a shortcut-opened panel ask you to
+> rerun `/agent-panel`; everything else works there.
 
 ### Keys
 

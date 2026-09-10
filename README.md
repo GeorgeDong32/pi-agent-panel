@@ -36,11 +36,20 @@ pi -e ./path/to/pi-agent-panel/extensions
 
 > **←** opens the panel when the input is empty — CC's exact "← for
 > agents", including right after a takeover, from inside the attached
-> agent's own session. With a non-empty draft, `←` stays hands-off and
-> `ctrl+b` remains the cursor-left move (a pi default binding); take care
-> in editors that rebind it. **Shift+Left** opens the panel regardless of
-> the draft. Takeover/detach picked from a shortcut-opened panel ask you to
-> rerun `/agent-panel`; everything else works there.
+> agent's own session. With a non-empty draft, `←`/`→` stay hands-off and
+> `ctrl+b`/`ctrl+f` remain the cursor moves. **Shift+Left** opens the panel
+> regardless of the draft. **→** (empty input) returns to your own
+> conversation when the main REPL is inside an attached agent's session —
+> the mirror of ←. Takeover/detach picked from a shortcut-opened panel work
+> too: they are dispatched as their `/agent-panel takeover|detach` command,
+> which runs with a fresh command context (the dispatched message itself is
+> never persisted nor sent to the model).
+>
+> These bindings override pi's built-in editor cursor keys, so pi shows an
+> informational `[Extension issues]` banner unless those keys are removed
+> from the built-in bindings. Recommended in `~/.pi/agent/keybindings.json`:
+> `{"tui.editor.cursorLeft": ["ctrl+b"], "tui.editor.cursorRight": ["ctrl+f"]}`
+> — no banner; word moves on alt/ctrl+arrow are untouched.
 
 ### Keys
 

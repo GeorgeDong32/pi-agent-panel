@@ -168,11 +168,25 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 	});
 
 	/** Stop the child's rpc process and switch the main REPL onto its session
-	 *  file — from here the conversation IS a normal, full-skin pi session. */
+	 *  file — from here the conversation IS a normal, full-skin pi session.
+	 *  On an already-attached agent this just switches to its session (it has
+	 *  no live child left to stop). */
 	const performTakeover = async (ctx: ExtensionCommandContext, id: string): Promise<void> => {
 		const supervisor = ensureCore().supervisor;
+		const current = supervisor.list().find((handle) => handle.id === id);
+		if (current?.attached) {
+			try {
+				await ctx.switchSession(current.sessionFile);
+			} catch (error) {
+				ctx.ui.notify(`agent-panel: switch failed (${error instanceof Error ? error.message : String(error)})`, "error");
+			}
+			return;
+		}
 		const taken = await supervisor.takeover(id);
-		if (!taken) return;
+		if (!taken) {
+			ctx.ui.notify(`agent-panel: cannot take over '${id}' (not running)`, "warning");
+			return;
+		}
 		try {
 			await ctx.switchSession(taken.sessionFile);
 			// The captured ctx may be flagged stale after the switch it just
@@ -264,6 +278,8 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 	// session, dispatch `/agent-panel detach` through sendUserMessage's
 	// command dispatch — that gives the action a fresh command context,
 	// which switchSession requires. Non-empty drafts stay hands-off.
+	// Matching is lenient on purpose: an exact session-path compare can miss
+	// (path normalization), so a single attached agent is an accepted fallback.
 	pi.registerShortcut("right", {
 		description: "Return to the previous conversation (detach the attached agent)",
 		handler: (ctx: ExtensionContext) => {
@@ -276,11 +292,11 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 			if (draft.length > 0) return;
 			const rt = ensureCore();
 			const currentSession = ctx.sessionManager.getSessionFile();
-			const attached = rt.supervisor.list().find(
-				(handle) => handle.attached && handle.sessionFile === currentSession,
-			);
-			if (!attached) return; // not inside an attached session — nothing to return from
-			pi.sendUserMessage(`/agent-panel detach ${attached.id}`, { expandPromptTemplates: true });
+			const attached = rt.supervisor.list().filter((handle) => handle.attached);
+			const target = attached.find((handle) => handle.sessionFile === currentSession)
+				?? (attached.length === 1 ? attached[0] : undefined);
+			if (!target) return; // not inside an attached session — nothing to return from
+			pi.sendUserMessage(`/agent-panel detach ${target.id}`, { expandPromptTemplates: true });
 		},
 	});
 

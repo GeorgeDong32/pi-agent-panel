@@ -418,10 +418,12 @@ export class FleetPanelComponent {
 	}
 
 	/** enter on a live agent: close the panel and let the command layer stop
-	 *  the rpc child and switch the main REPL onto its session file. */
+	 *  the rpc child and switch the main REPL onto its session file. On an
+	 *  attached agent the same action simply re-opens its (already running)
+	 *  session — the command layer switches to it without a takeover step. */
 	private requestTakeover(): void {
 		const handle = this.rows[this.selected]?.handle;
-		if (!handle || !isLiveHandle(handle)) return;
+		if (!handle || handle.state === "crashed") return;
 		this.done({ takeover: handle.id });
 	}
 

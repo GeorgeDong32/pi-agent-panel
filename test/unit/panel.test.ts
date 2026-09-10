@@ -321,3 +321,13 @@ test("enter on a live agent requests takeover; d on an attached agent requests d
 	h2.panel.handleInput("d");
 	assert.deepEqual(h2.action(), { detach: b.id });
 });
+
+test("enter on an attached agent still requests takeover (re-open its session)", async () => {
+	const h = createPanelHarness();
+	const { handle } = await spawnAgent(h, "a");
+	await h.supervisor.takeover(handle.id);
+	h.panel.invalidate();
+	h.panel.handleInput("\r");
+	assert.equal(h.isDone(), true, "attached row enter closes the panel");
+	assert.deepEqual(h.action(), { takeover: handle.id });
+});

@@ -82,10 +82,11 @@ export function createStatusPill(
 	return {
 		update: (ctx: ExtensionContext) => {
 			if (!ctx.hasUI) return;
-			const working = supervisor.list().filter((h) => h.state === "working" || h.state === "starting").length;
-			const awaiting = supervisor.list().filter((h) => h.state === "awaiting-input").length;
+			// One change-derived snapshot per event (plan A9) — the two full
+			// list() scans this used to do re-walked the fleet twice per event.
+			const roster = supervisor.roster();
 			try {
-				ctx.ui.setWidget(PILL_WIDGET_KEY, pillLine(working, awaiting, ctx.ui.theme));
+				ctx.ui.setWidget(PILL_WIDGET_KEY, pillLine(roster.working, roster.awaiting, ctx.ui.theme));
 			} catch {
 				// Widget slots are best-effort; never break the caller.
 			}

@@ -29,7 +29,8 @@ pi -e ./path/to/pi-agent-panel/extensions
 
 ```
 /agent-panel spawn <name> <prompt...>   # start a background task (long-lived rpc child)
-/agent-panel archive <name|id>          # archive: kill + hide, session JSONL kept
+/agent-panel archive <name|id>          # remove from the panel (kill process, hide, disk untouched)
+/agent-panel resume <name|id>           # revive a stopped/history row as a background agent
 /agent-panel stop <name|id>             # alias of archive (v0.1 compat)
 /agent-panel                            # open the fullscreen panel (or alt+p / shift+left)
 ```
@@ -62,7 +63,9 @@ pi -e ./path/to/pi-agent-panel/extensions
 | type any character | starts a new-task composer (type-to-talk) | starts composing (type-to-talk) |
 | `n` | new-task composer (same as typing directly) | — |
 | `x` | abort current turn of selected agent (rpc abort, agent stays alive) | abort current turn |
-| `X` / `ctrl+x` | archive selected (kill + hide; `pi --session <file>` can reopen) | — |
+| `x` | two-stage: stop the background process (row stays), then remove the row from the panel — disk is never touched | — |
+| `X` / `ctrl+x` | remove the selected row immediately (same removal, one press) | — |
+| `enter` | live row: takeover · dead/history row: revive it as a background agent (same dir, same id) | — |
 | `p` | pin/unpin | — |
 | `PgUp/PgDn` | — | page transcript (stops auto-follow) |
 | `←` / `esc` | (esc) close panel | back to list (`←` works even with the composer focused while the draft is empty) |
@@ -81,7 +84,7 @@ The panel composer is a real pi-tui `Editor`: CJK/IME input, multi-line, termina
 6. Press `X` on an agent — it moves to `Archived`, the process is gone, and `~/.pi/agent/agent-panel/<id>/session.jsonl` remains (`pi --session <file>` reopens it).
 7. Close pi (`esc`/`ctrl+d`). `pgrep -f agent-panel` shows no leftover children — rpc children self-terminate on stdin EOF.
 
-Child artifacts live under `~/.pi/agent/agent-panel/<id>/`: `session.jsonl` (child's full session), `events.jsonl` (event mirror), `crash.log` (post-mortem). The archived set is tracked in `~/.pi/agent/agent-panel/state.json`.
+Child artifacts live under `~/.pi/agent/agent-panel/<id>/`: `session.jsonl` (child's full session), `events.jsonl` (event mirror), `crash.log` (post-mortem). `state.json` (atomic 0600 writes) tracks the removed set (`archivedIds`) and pins (`pinnedIds`) — removal and pins survive host restarts. The child dir basename **is** the agent id, so history keeps its ids across restarts; removed agents stay hidden, the rest reappear as resumable history rows. Removal only affects the panel: session files always stay on disk and `pi --session <file>` can always reopen them. Single-host assumption: two pi hosts sharing this directory would see each other's agents as history rows (known limitation).
 
 ## Configuration
 
@@ -102,7 +105,7 @@ Known limitations (documented, not hidden):
 
 - Each agent is a full resident pi process (Node + agent runtime) — the pool limit defaults to **4** for that reason; archiving frees the slot. Memory-wise this is the deliberate trade of long-lived conversational agents.
 - Children run with `--no-extensions --no-skills` and a clean env (`PI_AGENT_PANEL_CHILD=1`); any child-side UI dialog is actively denied and shown as `⚠ child ui request denied`. Permission bridging through `extension_ui_request` is phase 2.
-- Cross-restart revive (`R` key placeholder in view mode) is phase 2: session files survive, but children are not respawned automatically.
+- Cross-restart persistence is live: history rows are discovered at startup, `enter` (or `R` in view mode) revives a row as a background agent on the same session file and id.
 - The main session's *temporarily switched* model is forwarded once at spawn (`provider/id`); model-switching inside a child afterwards belongs to the child.
 - The overlay uses `ctx.ui.custom` overlay mode (officially marked Experimental).
 - Multi-widget coexistence with other extensions' widgets is best-effort; use the `pill` config if visuals collide.

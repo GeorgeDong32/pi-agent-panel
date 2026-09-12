@@ -65,6 +65,14 @@ export interface AgentHandle {
 	attached?: boolean;
 }
 
+/** Change-derived roster counts (plan A9): cached by the supervisor and
+ *  shared by every consumer (pill, panel header) — one scan per change. */
+export interface RosterSnapshot {
+	working: number;
+	awaiting: number;
+	archived: number;
+}
+
 export type SupervisorEvent =
 	| { type: "agent-added"; handle: AgentHandle }
 	| { type: "agent-updated"; handle: AgentHandle }

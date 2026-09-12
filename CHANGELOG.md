@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased (2026-09-08, evening)
+## 0.3.0 (2026-09-12)
+
+- **Pill renders from a change-derived roster snapshot (plan A9)**: the supervisor caches working/awaiting/archived counts once per state change (`roster()`, invalidated at `emit()` — the single point of state change); the status pill previously re-scanned the whole fleet twice on every child event.
+
+- **Cross-restart persistence (plan B6b)**: startup discovery rebuilds every `~/.pi/agent/agent-panel/<id>/` child dir as a resumable history row — the dir basename IS the agent id, so ids survive restarts. Removed agents stay hidden across restarts (the persisted `archivedIds` set is now actually consumed); pins persist too (`pinnedIds` in the same atomic state file). New interactions: `enter` (or `R` in view mode) on a dead/history row revives it as a background agent on the same session file and id (`/agent-panel resume <name|id>`); `x` is two-stage CC-style — first press stops the background process (row stays), second press removes the row from the panel. Removal is panel-only: session/events files are never deleted, `pi --session <file>` can always reopen them. Known limitation: single-host assumption (two pi hosts sharing the directory see each other's agents as history rows).
+
+
+- **Honest truncation counts (plan B6a)**: the conversation view's "N older events not shown" now counts every event line in the whole `events.jsonl` (chunked byte scan), instead of only lines inside the 64KB tail window — anything older than the window was silently under-reported before.
+- **Atomic state.json writes (plan B6a)**: `state.json` is written via tmp+fsync+rename with 0600 permissions; a torn write can no longer leave a half-written file for the next startup.
+- **Archived rows release their process references (plan B6a)**: archive/takeover now drop the stopped RpcSession reference (inert stub in its place) so dead client/process objects are not pinned for the host's lifetime; a repeated archive stays a clean no-op.
+- **Detach closes the two-writer window (plan B5)**: `/agent-panel detach` now switches the main REPL off the agent session *before* respawning the background driver — previously both writers briefly coexisted on the same JSONL, relying on the user being idle. A failed home switch now keeps the agent attached for a retry instead of respawning a second writer; a failed respawn surfaces the agent as a crashed row instead of silently vanishing it from the panel (`markCrashed` keeps spawn-failure rows listed). Behavior change: "detach 时回 home 的时机变早"（switch 先行）。
+- **Host-effects seam + takeover/detach unit tests (plan C4)**: `performTakeover`/`performDetach` are now module-level `runTakeover`/`runDetach` taking an injectable `HostEffects` (`extensions/lib/host-effects.ts`); the rollback path, ordering, and failure modes are covered by 8 new unit tests driving a real FleetSupervisor with the fake-rpc harness — these paths were manual-test-only before.
+
+### Earlier in 0.3.0 — takeover/detach interactions (2026-09-08, evening)
 
 - **Takeover/detach work from shortcut-opened panels too** (user feedback:
   the "needs the command context" warning broke the ← → enter flow). Panel
@@ -45,7 +58,7 @@
   they work via `/agent-panel`, not `alt+p`. `space` keeps the in-panel
   quick look (native message components).
 
-## Unreleased fixes (2026-09-08, post-0.2.0)
+### Earlier in 0.3.0 — fixes since 0.2.0 (2026-09-08)
 
 - **Silent notifications (user feedback: "duplicate notification cards")**:
   pty capture proved the render layer shows each card exactly once (883/883

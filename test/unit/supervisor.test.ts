@@ -117,24 +117,20 @@ test("abort forwards to the session only while live", async () => {
 	assert.equal(session.aborts, 1);
 });
 
-test("archive hides from live groups, stops the process, keeps the record, persists state.json", async () => {
+test("archive removes the row from the panel, stops the process, persists state.json (B6b)", async () => {
 	const { supervisor, sessions, rootDir } = createHarness();
 	const handle = await supervisor.spawn({ name: "alpha", cwd: "/tmp" });
 	assert.equal(await supervisor.archive(handle.id), true);
-	const after = supervisor.list().find((h) => h.id === handle.id);
-	assert.equal(after?.state, "archived");
-	assert.ok(after?.endedAt);
-	assert.equal(groupOf(after.state), "archived");
+	// Removal semantics (B6b): the row is gone from list(), disk untouched.
+	assert.equal(supervisor.list().find((h) => h.id === handle.id), undefined);
+	assert.ok(existsSync(handle.eventsFile), "events file kept");
 	const session = sessions[0] as FakeRpcSession;
 	assert.equal(session.stopCalls, 1);
-	// Archived ids persist for cross-restart hiding (revive-ready).
+	// The removal persists for cross-restart hiding.
 	const state = JSON.parse(readFileSync(`${rootDir}/state.json`, "utf-8")) as { archivedIds: string[] };
 	assert.deepEqual(state.archivedIds, [handle.id]);
 	// Second archive is a no-op.
 	assert.equal(await supervisor.archive(handle.id), false);
-	// Events from a dying archived child are ignored.
-	session.emit({ type: "agent_start" });
-	assert.equal(supervisor.list()[0]?.state, "archived");
 });
 
 test("events are mirrored to events.jsonl and tail formats them", async () => {

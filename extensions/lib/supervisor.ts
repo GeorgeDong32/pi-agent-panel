@@ -22,6 +22,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { realRpcSessionFactory } from "./rpc-session.ts";
 import type {
+	RosterSnapshot,
 	AgentHandle,
 	AgentSpec,
 	AgentState,
@@ -53,8 +54,11 @@ interface ChildRecord {
 	handle: AgentHandle;
 	session: RpcSession;
 	unsubscribeEvents: () => void;
-	eventsStream: fs.WriteStream;
+	/** Append mirror stream; created lazily so discovered rows cost no fd. */
+	eventsStream?: fs.WriteStream;
 	probe: ReturnType<typeof setInterval> | undefined;
+	/** Rebuilt from disk at startup (B6b): no live process behind it. */
+	discovered?: boolean;
 	/** Origin of the in-flight turn (reset to background at turn end). */
 	currentOrigin: PromptOrigin;
 	finalized: boolean;
@@ -103,7 +107,12 @@ export class FleetSupervisor {
 	/** Raw per-child rpc events, tapped for the panel's conversation view. */
 	private readonly rawListeners = new Set<(id: string, event: RpcAgentEvent) => void>();
 	private readonly archivedIds: Set<string>;
+	private readonly pinnedIds: Set<string>;
 	private disposed = false;
+	/** Roster cache (plan A9): emit() is the single point of state change,
+	 *  so it is the only invalidation trigger. */
+	private rosterDirty = true;
+	private rosterCache?: RosterSnapshot;
 
 	constructor(deps: SupervisorDeps = {}) {
 		this.sessionFactory = deps.sessionFactory ?? realRpcSessionFactory;
@@ -111,7 +120,69 @@ export class FleetSupervisor {
 		this.limit = deps.limit ?? DEFAULT_LIMIT;
 		this.now = deps.now ?? Date.now;
 		this.probeMs = deps.probeMs ?? DEFAULT_PROBE_MS;
-		this.archivedIds = this.loadArchivedIds();
+		const state = this.loadState();
+		this.archivedIds = state.archivedIds;
+		this.pinnedIds = state.pinnedIds;
+		this.discoverChildren();
+	}
+
+	/** Rebuild rows for child dirs on disk (plan B6b): the dir basename IS
+	 *  the agent id (spawn derives it that way), so history keeps its ids
+	 *  across restarts. Rows land as archived, no process, no probe, no fd.
+	 *  Rows whose id is in the archived set stay hidden — removal survives
+	 *  restarts. */
+	private discoverChildren(): void {
+		let entries: Array<fs.Dirent>;
+		try {
+			entries = fs.readdirSync(this.rootDir, { withFileTypes: true });
+		} catch {
+			return; // no fleet dir yet
+		}
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			const id = entry.name;
+			if (this.children.has(id)) continue;
+			const childDirPath = path.join(this.rootDir, id);
+			const sessionFile = path.join(childDirPath, "session.jsonl");
+			const eventsFile = path.join(childDirPath, "events.jsonl");
+			try {
+				if (!fs.existsSync(sessionFile) && !fs.existsSync(eventsFile)) continue;
+			} catch {
+				continue;
+			}
+			let startedAt = this.now();
+			try {
+				startedAt = Math.round(fs.statSync(childDirPath).mtimeMs);
+			} catch {
+				// best-effort
+			}
+			const handle: AgentHandle = {
+				id,
+				name: id,
+				state: "archived",
+				cwd: process.cwd(),
+				startedAt,
+				tokens: { input: 0, output: 0, cost: 0 },
+				toolCount: 0,
+				turnCount: 0,
+				sessionFile,
+				eventsFile,
+				lastLine: "",
+				lastActivityAt: startedAt,
+				pendingCount: 0,
+				pinned: this.pinnedIds.has(id),
+			};
+			this.children.set(id, {
+				handle,
+				session: inertSessionStub(),
+				unsubscribeEvents: () => {},
+				eventsStream: undefined,
+				probe: undefined,
+				currentOrigin: "background",
+				finalized: false,
+				discovered: true,
+			});
+		}
 	}
 
 	/** Create a live rpc child. Resolves once the session is started and its
@@ -246,17 +317,28 @@ export class FleetSupervisor {
 	 * is persisted to state.json so the hiding survives restarts (revive is
 	 * phase 2).
 	 */
+	/** Archive = remove from the panel (plan B6b semantics): stop the
+	 *  process, persist the id so the removal survives restarts, drop the
+	 *  row. Disk files are never touched — the session stays resumable by
+	 *  pi itself. */
 	async archive(id: string): Promise<boolean> {
 		const record = this.children.get(id);
-		if (!record || record.handle.state === "archived") return false;
+		if (!record) return false;
+		if (record.discovered) {
+			// Discovered history row: nothing to stop, just hide it.
+			this.children.delete(id);
+			this.archivedIds.add(id);
+			this.persistState();
+			return true;
+		}
 		this.clearProbe(record);
 		record.unsubscribeEvents();
 		record.handle.state = "archived";
 		record.handle.endedAt = this.now();
 		record.handle.currentTool = undefined;
 		this.archivedIds.add(id);
-		this.persistArchivedIds();
-		record.eventsStream.end();
+		this.persistState();
+		record.eventsStream?.end();
 		this.emit({ type: "agent-updated", handle: this.snapshot(record.handle) });
 		this.emit({ type: "agent-final", handle: this.snapshot(record.handle) });
 		try {
@@ -264,13 +346,58 @@ export class FleetSupervisor {
 		} catch {
 			// The kill chain escalates internally; a rejected stop still killed.
 		}
+		// Release the stopped client/process reference (plan B6a) and drop
+		// the row: "removed from the panel" means list() no longer shows it.
+		record.session = inertSessionStub();
+		this.children.delete(id);
 		return true;
+	}
+
+	/** Stage 1 of the two-stage x (plan B6b): stop the background process
+	 *  but keep the row listed (crashed) — x again removes it. */
+	async stop(id: string): Promise<boolean> {
+		const record = this.children.get(id);
+		if (!record || !isLive(record.handle)) return false;
+		this.clearProbe(record);
+		record.unsubscribeEvents();
+		record.handle.state = "crashed";
+		record.handle.endedAt = this.now();
+		record.handle.currentTool = undefined;
+		record.eventsStream?.end();
+		try {
+			await record.session.stop();
+		} catch {
+			// The kill chain escalates internally; a rejected stop still killed.
+		}
+		record.session = inertSessionStub();
+		this.emit({ type: "agent-updated", handle: this.snapshot(record.handle) });
+		return true;
+	}
+
+	/** Revive a non-live row (discovered history, crashed, or stopped):
+	 *  respawn a background driver on the same session file — the child dir
+	 *  basename keeps the id stable across the round trip (plan B6b). */
+	async resume(id: string): Promise<AgentHandle> {
+		const record = this.children.get(id);
+		if (!record) throw new Error(`agent-panel: no agent matches '${id}'`);
+		if (isLive(record.handle)) return this.snapshot(record.handle);
+		const { name, cwd, sessionFile } = record.handle;
+		this.clearProbe(record);
+		record.unsubscribeEvents();
+		record.eventsStream?.end();
+		this.children.delete(id);
+		this.archivedIds.delete(id);
+		this.persistState();
+		return this.spawn({ name, cwd, resume: sessionFile });
 	}
 
 	pin(id: string, pinned?: boolean): boolean {
 		const record = this.children.get(id);
 		if (!record) return false;
 		record.handle.pinned = pinned ?? !record.handle.pinned;
+		if (record.handle.pinned) this.pinnedIds.add(id);
+		else this.pinnedIds.delete(id);
+		this.persistState();
 		this.emit({ type: "agent-updated", handle: this.snapshot(record.handle) });
 		return true;
 	}
@@ -292,13 +419,16 @@ export class FleetSupervisor {
 		record.handle.endedAt = this.now();
 		record.handle.currentTool = undefined;
 		this.archivedIds.add(id);
-		this.persistArchivedIds();
-		record.eventsStream.end();
+		this.persistState();
+		record.eventsStream?.end();
 		try {
 			await record.session.stop();
 		} catch {
 			// The kill chain escalates internally; a rejected stop still killed.
 		}
+		// Release the stopped client/process reference (plan B6a): archived
+		// rows otherwise pin dead RpcSession objects for the host's lifetime.
+		record.session = inertSessionStub();
 		this.emit({ type: "agent-updated", handle: this.snapshot(record.handle) });
 		return this.snapshot(record.handle);
 	}
@@ -314,15 +444,37 @@ export class FleetSupervisor {
 		const { name, cwd, sessionFile } = record.handle;
 		this.clearProbe(record);
 		record.unsubscribeEvents();
-		record.eventsStream.end();
+		record.eventsStream?.end();
 		this.children.delete(id);
 		this.archivedIds.delete(id);
-		this.persistArchivedIds();
+		this.persistState();
 		return this.spawn({ name, cwd, resume: sessionFile });
 	}
 
 	list(): AgentHandle[] {
-		return [...this.children.values()].map((record) => this.snapshot(record.handle));
+		return [...this.children.values()]
+			.filter((record) => !(record.discovered && this.archivedIds.has(record.handle.id)))
+			.map((record) => this.snapshot(record.handle));
+	}
+
+	/** Change-derived roster counts (plan A9): computed once per state
+	 *  change, served from cache otherwise — pill/panel share the snapshot
+	 *  instead of re-scanning the fleet per event. */
+	roster(): RosterSnapshot {
+		if (!this.rosterDirty && this.rosterCache) return this.rosterCache;
+		let working = 0;
+		let awaiting = 0;
+		let archived = 0;
+		for (const record of this.children.values()) {
+			if (record.discovered && this.archivedIds.has(record.handle.id)) continue;
+			const state = record.handle.state;
+			if (state === "working" || state === "starting") working += 1;
+			else if (state === "awaiting-input") awaiting += 1;
+			else archived += 1;
+		}
+		this.rosterCache = { working, awaiting, archived };
+		this.rosterDirty = false;
+		return this.rosterCache;
 	}
 
 	/**
@@ -345,10 +497,16 @@ export class FleetSupervisor {
 	 * IO-safe like tail(): failures yield an empty result, never a throw.
 	 */
 	tailEvents(id: string, maxEvents: number): { events: RpcAgentEvent[]; dropped: number } {
+		const record = this.children.get(id);
+		if (!record) return { events: [], dropped: 0 };
 		const window = this.readEventWindow(id);
 		const events = window.filter((evt): evt is RpcAgentEvent => typeof evt !== "string");
 		const sliced = events.slice(-Math.max(0, maxEvents));
-		return { events: sliced, dropped: window.length - sliced.length };
+		// Honest dropped count (plan B6a): count every non-empty line in the
+		// WHOLE file — previously only lines inside the 64KB window counted, so
+		// everything older than the window was silently under-reported.
+		const totalLines = countNonEmptyLines(record.handle.eventsFile);
+		return { events: sliced, dropped: Math.max(0, totalLines - sliced.length) };
 	}
 
 	/** Every event in the trailing TAIL_READ_BYTES window (parsed; unparsable
@@ -407,7 +565,7 @@ export class FleetSupervisor {
 		for (const record of this.children.values()) {
 			this.clearProbe(record);
 			record.unsubscribeEvents();
-			record.eventsStream.end();
+			record.eventsStream?.end();
 			if (isLive(record.handle)) {
 				record.handle.state = "archived";
 				record.handle.endedAt = this.now();
@@ -424,6 +582,7 @@ export class FleetSupervisor {
 		// Mirror first: the disk copy is the full set even if aggregation below
 		// changes nothing visible.
 		try {
+			record.eventsStream ??= fs.createWriteStream(record.handle.eventsFile, { flags: "a" });
 			record.eventsStream.write(`${JSON.stringify(evt)}\n`);
 		} catch {
 			// Mirroring is best-effort; supervision continues.
@@ -511,14 +670,27 @@ export class FleetSupervisor {
 	}
 
 	private markCrashed(handle: AgentHandle, exitCode: number | undefined, reason: string): void {
-		const record = this.children.get(handle.id);
-		if (record) {
-			if (record.finalized) return;
-			record.finalized = true;
-			this.clearProbe(record);
-			record.unsubscribeEvents();
-			record.eventsStream.end();
+		let record = this.children.get(handle.id);
+		if (!record) {
+			// Spawn failed before the record was wired: keep the crashed row
+			// listed (plan B5) — otherwise agent-final fires for a handle
+			// list() never returns and the agent silently vanishes.
+			record = {
+				handle,
+				session: inertSessionStub(),
+				unsubscribeEvents: () => {},
+				eventsStream: undefined,
+				probe: undefined,
+				currentOrigin: "background",
+				finalized: false,
+			};
+			this.children.set(handle.id, record);
 		}
+		if (record.finalized) return;
+		record.finalized = true;
+		this.clearProbe(record);
+		record.unsubscribeEvents();
+		record.eventsStream?.end();
 		handle.state = "crashed";
 		handle.endedAt = this.now();
 		handle.currentTool = undefined;
@@ -534,30 +706,46 @@ export class FleetSupervisor {
 		this.emit({ type: "agent-final", handle: this.snapshot(handle) });
 	}
 
-	private persistArchivedIds(): void {
+	private persistState(): void {
 		try {
 			fs.mkdirSync(this.rootDir, { recursive: true });
-			fs.writeFileSync(
-				path.join(this.rootDir, "state.json"),
-				`${JSON.stringify({ archivedIds: [...this.archivedIds] }, null, "\t")}\n`,
-			);
+			// Atomic write (tmp+rename, 0600 — plan B6a): a torn write must
+			// never leave a half-written state.json for the next startup.
+			const target = path.join(this.rootDir, "state.json");
+			const tmp = `${target}.tmp`;
+			const fd = fs.openSync(tmp, "w", 0o600);
+			try {
+				fs.writeFileSync(
+					fd,
+					`${JSON.stringify({ archivedIds: [...this.archivedIds], pinnedIds: [...this.pinnedIds] }, null, "\t")}\n`,
+				);
+				fs.fsyncSync(fd);
+			} finally {
+				fs.closeSync(fd);
+			}
+			fs.renameSync(tmp, target);
 		} catch {
-			// Persistence is best-effort; in-memory state still hides the agent.
+			// Persistence is best-effort; in-memory state still applies.
 		}
 	}
 
-	private loadArchivedIds(): Set<string> {
+	private loadState(): { archivedIds: Set<string>; pinnedIds: Set<string> } {
 		try {
-			const raw = JSON.parse(
-				fs.readFileSync(path.join(this.rootDir, "state.json"), "utf-8"),
-			) as { archivedIds?: unknown };
-			if (Array.isArray(raw.archivedIds)) {
-				return new Set(raw.archivedIds.filter((value): value is string => typeof value === "string"));
-			}
+			const raw = JSON.parse(fs.readFileSync(path.join(this.rootDir, "state.json"), "utf-8")) as {
+				archivedIds?: unknown;
+				pinnedIds?: unknown;
+			};
+			const archived = Array.isArray(raw.archivedIds)
+				? raw.archivedIds.filter((v): v is string => typeof v === "string")
+				: [];
+			const pinned = Array.isArray(raw.pinnedIds)
+				? raw.pinnedIds.filter((v): v is string => typeof v === "string")
+				: [];
+			return { archivedIds: new Set(archived), pinnedIds: new Set(pinned) };
 		} catch {
-			// Missing/invalid state file starts with an empty set.
+			// Missing/invalid state file starts with empty sets.
+			return { archivedIds: new Set(), pinnedIds: new Set() };
 		}
-		return new Set();
 	}
 
 	private clearProbe(record: ChildRecord): void {
@@ -575,6 +763,7 @@ export class FleetSupervisor {
 	}
 
 	private emit(event: SupervisorEvent): void {
+		this.rosterDirty = true;
 		for (const listener of this.listeners) {
 			try {
 				listener(event);
@@ -587,6 +776,51 @@ export class FleetSupervisor {
 
 function isLive(handle: AgentHandle): boolean {
 	return handle.state === "starting" || handle.state === "working" || handle.state === "awaiting-input";
+}
+
+/** Inert RpcSession stand-in for crashed rows that never wired a session. */
+function inertSessionStub(): import("./types.ts").RpcSession {
+	return {
+		prompt: async () => {},
+		steer: async () => {},
+		abort: async () => {},
+		getState: async () => {
+			throw new Error("agent crashed");
+		},
+		stop: async () => {},
+		onEvent: () => () => {},
+	};
+}
+
+/** Count non-empty lines in a file without loading it (chunked byte scan). */
+function countNonEmptyLines(file: string): number {
+	try {
+		const fd = fs.openSync(file, "r");
+		try {
+			const chunk = Buffer.alloc(64 * 1024);
+			let count = 0;
+			let inLine = false;
+			for (;;) {
+				const read = fs.readSync(fd, chunk, 0, chunk.length, null);
+				if (read === 0) break;
+				for (let i = 0; i < read; i++) {
+					const byte = chunk[i];
+					if (byte === 0x0a) {
+						if (inLine) count += 1;
+						inLine = false;
+					} else if (byte !== 0x0d && byte !== 0x20 && byte !== 0x09) {
+						inLine = true;
+					}
+				}
+			}
+			if (inLine) count += 1;
+			return count;
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return 0;
+	}
 }
 
 export function groupOf(state: AgentState): "working" | "awaiting-input" | "archived" {

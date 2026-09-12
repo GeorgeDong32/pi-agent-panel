@@ -27,6 +27,7 @@ import { FleetSupervisor } from "./lib/supervisor.ts";
 import { openFleetPanel } from "./lib/panel.ts";
 import { createNotificationBridge, type PanelFocus } from "./lib/bridge.ts";
 import { createStatusPill } from "./lib/pill.ts";
+import { commandContextEffects, type HostEffects } from "./lib/host-effects.ts";
 
 const GLOBAL_CORE_KEY = "__piAgentPanelCore";
 const GLOBAL_CLEANUP_KEY = "__piAgentPanelRuntimeCleanup";
@@ -45,6 +46,95 @@ interface Core {
 		unsubscribePillEvents: () => void;
 		lastCtx: ExtensionContext | null;
 	};
+}
+
+/**
+ * Stop the child's rpc process and switch the main REPL onto its session
+ * file — from here the conversation IS a normal, full-skin pi session. On an
+ * already-attached agent this just switches to its session (it has no live
+ * child left to stop). Host calls go through the injectable seam so the
+ * rollback path is unit-testable (plan C4).
+ */
+export async function runTakeover(
+	deps: { supervisor: FleetSupervisor; host: HostEffects },
+	id: string,
+): Promise<void> {
+	const { supervisor, host } = deps;
+	const current = supervisor.list().find((handle) => handle.id === id);
+	if (current?.attached) {
+		try {
+			await host.switchSession(current.sessionFile);
+		} catch (error) {
+			host.notify(`agent-panel: switch failed (${error instanceof Error ? error.message : String(error)})`, "error");
+		}
+		return;
+	}
+	const taken = await supervisor.takeover(id);
+	if (!taken) {
+		host.notify(`agent-panel: cannot take over '${id}' (not running)`, "warning");
+		return;
+	}
+	try {
+		await host.switchSession(taken.sessionFile);
+		host.notify(`agent-panel: '${taken.name}' attached to the main REPL — /agent-panel, d to detach`, "info");
+	} catch (error) {
+		// Switch failed: give the session back to background supervision so
+		// the conversation isn't stranded in attached limbo.
+		await supervisor.detach(id);
+		host.notify(`agent-panel: takeover failed (${error instanceof Error ? error.message : String(error)}) — agent detached back`, "error");
+	}
+}
+
+/**
+ * Respawn background supervision on an attached conversation and switch the
+ * main REPL back to the session it came from (chain: last switch).
+ *
+ * Ordering (plan B5): the REPL leaves the agent session FIRST — while it
+ * stays there, the user and a respawned driver would both write the same
+ * JSONL. If the switch fails the agent stays attached (no second writer)
+ * instead of respawning into a live conflict.
+ */
+export async function runDetach(
+	deps: {
+		supervisor: FleetSupervisor;
+		host: HostEffects;
+		homeSessionFile?: string;
+	},
+	id: string,
+): Promise<void> {
+	const { supervisor, host, homeSessionFile: home } = deps;
+	if (!home) {
+		host.notify("agent-panel: no previous session to return to (detach unavailable)", "warning");
+		return;
+	}
+	const attached = supervisor.list().find((handle) => handle.id === id);
+	if (!attached?.attached) return;
+	try {
+		await host.switchSession(home);
+	} catch (error) {
+		host.notify(
+			`agent-panel: detach switch failed (${error instanceof Error ? error.message : String(error)}) — agent stays attached`,
+			"error",
+		);
+		return;
+	}
+	let handle: Awaited<ReturnType<FleetSupervisor["detach"]>>;
+	try {
+		handle = await supervisor.detach(id);
+	} catch (error) {
+		// The respawn failed after the REPL already left: markCrashed listed
+		// the row as crashed — surface that instead of throwing mid-command.
+		host.notify(
+			`agent-panel: detach respawn failed (${error instanceof Error ? error.message : String(error)}) — agent crashed`,
+			"error",
+		);
+		return;
+	}
+	if (!handle) {
+		host.notify("agent-panel: detach failed — agent stays attached", "warning");
+		return;
+	}
+	host.notify(`agent-panel: '${handle.name}' detached — running in background again`, "info");
 }
 
 export default function registerAgentPanel(pi: ExtensionAPI): void {
@@ -134,6 +224,27 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 				await performTakeover(ctx, item.id);
 				return;
 			}
+			if (parts[0] === "resume") {
+				const target = parts[1];
+				if (!target) {
+					ctx.ui.notify("Usage: /agent-panel resume <name|id>", "warning");
+					return;
+				}
+				const item = ensureCore()
+					.supervisor.list()
+					.find((handle) => handle.id === target || handle.name === target);
+				if (!item) {
+					ctx.ui.notify(`agent-panel: no agent matches '${target}'`, "warning");
+					return;
+				}
+				try {
+					const handle = await ensureCore().supervisor.resume(item.id);
+					ctx.ui.notify(`agent-panel: '${handle.name}' revived in the background (${handle.id})`, "info");
+				} catch (error) {
+					ctx.ui.notify(`agent-panel: ${error instanceof Error ? error.message : String(error)}`, "error");
+				}
+				return;
+			}
 			if (parts[0] === "detach") {
 				// Optional target; default = the attached agent whose session the
 				// main REPL currently owns (i.e. "return to my own conversation").
@@ -161,6 +272,7 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 				const action = await openFleetPanel(ctx, ensureCore().supervisor, ensureCore().focus);
 				if (action?.takeover) await performTakeover(ctx, action.takeover);
 				else if (action?.detach) await performDetach(ctx, action.detach);
+				else if (action?.resume) await performResume(ctx, action.resume);
 			} finally {
 				panelOpen = false;
 			}
@@ -170,53 +282,32 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 	/** Stop the child's rpc process and switch the main REPL onto its session
 	 *  file — from here the conversation IS a normal, full-skin pi session.
 	 *  On an already-attached agent this just switches to its session (it has
-	 *  no live child left to stop). */
-	const performTakeover = async (ctx: ExtensionCommandContext, id: string): Promise<void> => {
-		const supervisor = ensureCore().supervisor;
-		const current = supervisor.list().find((handle) => handle.id === id);
-		if (current?.attached) {
-			try {
-				await ctx.switchSession(current.sessionFile);
-			} catch (error) {
-				ctx.ui.notify(`agent-panel: switch failed (${error instanceof Error ? error.message : String(error)})`, "error");
-			}
-			return;
-		}
-		const taken = await supervisor.takeover(id);
-		if (!taken) {
-			ctx.ui.notify(`agent-panel: cannot take over '${id}' (not running)`, "warning");
-			return;
-		}
+	 *  no live child left to stop). Module-level + HostEffects-injected so the
+	 *  rollback path is unit-testable (plan C4). */
+	const performTakeover = async (ctx: ExtensionCommandContext, id: string): Promise<void> =>
+		runTakeover({ supervisor: ensureCore().supervisor, host: commandContextEffects(ctx) }, id);
+
+	/** Revive a non-live row as a background agent (same child dir, same id). */
+	const performResume = async (ctx: ExtensionCommandContext, id: string): Promise<void> => {
 		try {
-			await ctx.switchSession(taken.sessionFile);
-			// The captured ctx may be flagged stale after the switch it just
-			// performed; the notify is cosmetic, the switch is the outcome.
-			try { ctx.ui.notify(`agent-panel: '${taken.name}' attached to the main REPL — /agent-panel, d to detach`, "info"); } catch {}
+			const handle = await ensureCore().supervisor.resume(id);
+			ctx.ui.notify(`agent-panel: '${handle.name}' revived in the background (${handle.id})`, "info");
 		} catch (error) {
-			// Switch failed: give the session back to background supervision so
-			// the conversation isn't stranded in attached limbo.
-			await supervisor.detach(id);
-			ctx.ui.notify(`agent-panel: takeover failed (${error instanceof Error ? error.message : String(error)}) — agent detached back`, "error");
+			ctx.ui.notify(`agent-panel: ${error instanceof Error ? error.message : String(error)}`, "error");
 		}
 	};
 
 	/** Respawn background supervision on an attached conversation and switch
 	 *  the main REPL back to the session it came from (chain: last switch). */
-	const performDetach = async (ctx: ExtensionCommandContext, id: string): Promise<void> => {
-		const home = ensureCore().lastMainSessionFile;
-		if (!home) {
-			ctx.ui.notify("agent-panel: no previous session to return to (detach unavailable)", "warning");
-			return;
-		}
-		const handle = await ensureCore().supervisor.detach(id);
-		if (!handle) return;
-		try {
-			await ctx.switchSession(home);
-			try { ctx.ui.notify(`agent-panel: '${handle.name}' detached — running in background again`, "info"); } catch {}
-		} catch (error) {
-			ctx.ui.notify(`agent-panel: detach switch failed (${error instanceof Error ? error.message : String(error)}) — agent still detached`, "error");
-		}
-	};
+	const performDetach = async (ctx: ExtensionCommandContext, id: string): Promise<void> =>
+		runDetach(
+			{
+				supervisor: ensureCore().supervisor,
+				host: commandContextEffects(ctx),
+				homeSessionFile: ensureCore().lastMainSessionFile,
+			},
+			id,
+		);
 
 	/** Shared panel entry for shortcut contexts (←, shift+left, alt+p).
 	 *  switchSession lives on the command context only, so a takeover/detach
@@ -237,6 +328,8 @@ export default function registerAgentPanel(pi: ExtensionAPI): void {
 				pi.sendUserMessage(`/agent-panel takeover ${action.takeover}`, { expandPromptTemplates: true });
 			} else if (action?.detach) {
 				pi.sendUserMessage(`/agent-panel detach ${action.detach}`, { expandPromptTemplates: true });
+			} else if (action?.resume) {
+				pi.sendUserMessage(`/agent-panel resume ${action.resume}`, { expandPromptTemplates: true });
 			}
 		} catch {
 			// e.g. runtime missing in odd modes; the command path reports details.

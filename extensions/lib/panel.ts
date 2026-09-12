@@ -70,6 +70,8 @@ export interface PanelAction {
 	takeover?: string;
 	/** Give an attached conversation back to background supervision. */
 	detach?: string;
+	/** Revive a non-live row: respawn a background driver on its session file. */
+	resume?: string;
 }
 
 export interface PanelDeps {
@@ -236,7 +238,7 @@ export class FleetPanelComponent {
 		if (matchesKey(data, "enter")) return this.requestTakeover();
 		if (matchesKey(data, "space")) return this.openSelected();
 		if (matchesKey(data, "n")) return this.activateComposer("new-task");
-		if (matchesKey(data, "x")) return this.abortSelected();
+		if (matchesKey(data, "x")) return this.xSelected();
 		if (matchesKey(data, "shift+x") || matchesKey(data, "ctrl+x")) return this.archiveSelected();
 		if (matchesKey(data, "d")) return this.requestDetach();
 		if (matchesKey(data, "p")) {
@@ -281,8 +283,7 @@ export class FleetPanelComponent {
 			return;
 		}
 		if (matchesKey(data, "shift+r")) {
-			this.statusMessage = "revive from session file is planned for a later phase";
-			this.tui.requestRender();
+			if (this.viewId) this.done({ resume: this.viewId });
 			return;
 		}
 		// Any other printable input starts composing (type-to-talk). Kitty
@@ -352,7 +353,7 @@ export class FleetPanelComponent {
 	private activateComposer(role: "new-task" | "reply"): void {
 		const handle = this.mode === "view" ? this.items.find((item) => item.id === this.viewId) : undefined;
 		if (role === "reply" && handle && (handle.state === "crashed" || handle.state === "archived")) {
-			this.statusMessage = "agent is not running — revive (R) is a later-phase feature";
+			this.statusMessage = "agent is not running — press R to revive it";
 			this.tui.requestRender();
 			return;
 		}
@@ -409,11 +410,27 @@ export class FleetPanelComponent {
 		}
 	}
 
-	private abortSelected(): void {
+	/** Two-stage x (plan B6b, CC-aligned): on a live row the first x stops
+	 *  the background process (row stays, x again removes it); on an
+	 *  already-stopped/history row x removes it from the panel — disk is
+	 *  never touched, the session stays resumable by pi itself. */
+	private xSelected(): void {
 		const handle = this.rows[this.selected]?.handle;
-		if (!handle || handle.state !== "working") return;
-		void this.supervisor.abort(handle.id);
-		this.statusMessage = `abort sent to '${handle.name}'`;
+		if (!handle) return;
+		if ((handle.state === "working" || handle.state === "starting" || handle.state === "awaiting-input") && !handle.attached) {
+			void this.supervisor.stop(handle.id).then(() => {
+				this.refresh();
+				this.tui.requestRender();
+			});
+			this.statusMessage = `stopped '${handle.name}' — x again to remove`;
+			this.tui.requestRender();
+			return;
+		}
+		void this.supervisor.archive(handle.id).then(() => {
+			this.refresh();
+			this.tui.requestRender();
+		});
+		this.statusMessage = `removed '${handle.name}' from the panel (session file kept)`;
 		this.tui.requestRender();
 	}
 
@@ -423,7 +440,12 @@ export class FleetPanelComponent {
 	 *  session — the command layer switches to it without a takeover step. */
 	private requestTakeover(): void {
 		const handle = this.rows[this.selected]?.handle;
-		if (!handle || handle.state === "crashed") return;
+		if (!handle) return;
+		if (handle.state === "crashed" || (handle.state === "archived" && !handle.attached)) {
+			// Dead/history row: revive it as a background agent (same dir, same id).
+			this.done({ resume: handle.id });
+			return;
+		}
 		this.done({ takeover: handle.id });
 	}
 
@@ -600,7 +622,7 @@ export class FleetPanelComponent {
 		if (this.mode === "view") {
 			return "space/enter reply · jk scroll · PgUp/PgDn page · x abort turn · ←/esc back to list";
 		}
-		return "enter takeover · space look · jk · n new · x abort · X archive · d detach · p pin · esc close";
+		return "enter takeover/resume · space look · jk · n new · x stop/remove · d detach · p pin · esc close";
 	}
 
 	invalidate(): void {

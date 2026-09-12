@@ -135,7 +135,9 @@ test("archive kills the child and no matching process survives", async () => {
 		);
 		assert.equal(await supervisor.archive(handle.id), true);
 		await waitFor(() => listProcessesMatching(rootDir) === "", 15_000, "rpc child process to exit");
-		assert.equal(supervisor.list().find((h) => h.id === handle.id)?.state, "archived");
+		// B6b removal semantics: archive drops the row from list(); the
+		// session file stays on disk for pi itself to resume.
+		assert.equal(supervisor.list().find((h) => h.id === handle.id), undefined);
 		assert.ok(existsSync(handle.sessionFile), "session file kept after archive");
 	} finally {
 		supervisor.dispose();

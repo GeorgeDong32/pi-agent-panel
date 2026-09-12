@@ -5,6 +5,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
+import { existsSync } from "node:fs";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { FleetPanelComponent } from "../../extensions/lib/panel.ts";
 import { createHarness, emitTurn, type FakeRpcSession } from "./fake-rpc.ts";
@@ -85,7 +86,8 @@ test("roster groups: working/awaiting/archived with live counts in header", asyn
 	await spawnAgent(h, "gone");
 	const workerSession = h.sessions[0] as FakeRpcSession;
 	workerSession.emit({ type: "agent_start" });
-	await h.supervisor.archive((h.supervisor.list().find((a) => a.name === "gone") as AgentHandle).id);
+	// B6b: archive removes rows; stop() leaves a crashed row in the archived group.
+	await h.supervisor.stop((h.supervisor.list().find((a) => a.name === "gone") as AgentHandle).id);
 	h.panel.invalidate();
 	const text = h.panel.render(WIDTH).join("\n");
 	assert.ok(text.includes("1 working · 1 awaiting input · 1 archived"), "three-segment counts");
@@ -212,19 +214,27 @@ test("composer reply while working auto-steers", async () => {
 	assert.deepEqual((h.sessions[0] as FakeRpcSession).sends[0], { text: "改一下方向", kind: "steer" });
 });
 
-test("x aborts the selected working agent; X archives it", async () => {
+test("two-stage x: first x stops the process, second x removes the row (B6b)", async () => {
 	const h = createPanelHarness();
 	const { handle } = await spawnAgent(h, "busy");
 	const session = h.sessions[0] as FakeRpcSession;
 	session.emit({ type: "agent_start" });
 	h.panel.invalidate();
+
+	// Stage 1: stop — the row stays, the process is stopped.
 	h.panel.handleInput("x");
-	assert.equal(session.aborts, 1);
-	h.panel.handleInput("X");
 	await new Promise((resolve) => setTimeout(resolve, 50));
-	assert.equal(h.supervisor.list()[0]?.state, "archived");
 	assert.equal(session.stopCalls, 1);
-	void handle;
+	const row = h.supervisor.list().find((r) => r.id === handle.id);
+	assert.ok(row, "row kept after stage 1");
+	assert.equal(row!.state, "crashed");
+
+	// Stage 2: remove — the row disappears, files stay on disk.
+	h.panel.invalidate();
+	h.panel.handleInput("x");
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(h.supervisor.list().find((r) => r.id === handle.id), undefined);
+	assert.ok(existsSync(handle.eventsFile), "disk untouched");
 });
 
 test("p pins the selected agent into the Pinned group", async () => {
@@ -241,16 +251,14 @@ test("p pins the selected agent into the Pinned group", async () => {
 test("view of a crashed agent: composer refuses with a hint", async () => {
 	const h = createPanelHarness();
 	const { handle } = await spawnAgent(h, "dead");
-	// Simulate crash through the supervisor's public surface.
-	await h.supervisor.archive(handle.id);
-	const crashed = h.supervisor.list().find((a) => a.id === handle.id) as AgentHandle;
-	crashed.state = "crashed";
+	// Stop the agent through the public surface: crashed row, no process.
+	await h.supervisor.stop(handle.id);
 	h.panel.invalidate();
 	h.panel.handleInput(" "); // open view (archived/crashed group row)
 	h.panel.handleInput("r"); // try to compose via type-to-talk
 	h.panel.invalidate();
 	const text = h.panel.render(WIDTH).join("\n");
-	assert.ok(text.includes("not running"), "composer disabled hint");
+	assert.ok(text.includes("press R to revive"), "composer disabled hint");
 	const session = h.sessions[0] as FakeRpcSession;
 	assert.equal(session.sends.length, 0, "nothing sent to a dead agent");
 });
@@ -300,6 +308,16 @@ test("kitty keyboard protocol sequences drive the same actions; releases ignored
 	assert.deepEqual((h.sessions[0] as FakeRpcSession).sends.map((x) => x.text), ["hi"]);
 });
 
+
+test("enter on a crashed/discovered row requests resume (B6b)", async () => {
+	const h = createPanelHarness();
+	const { handle } = await spawnAgent(h, "dead");
+	await h.supervisor.stop(handle.id);
+	h.panel.invalidate();
+	h.panel.handleInput("\r");
+	assert.equal(h.isDone(), true, "panel closed for resume");
+	assert.deepEqual(h.action(), { resume: handle.id });
+});
 
 test("enter on a live agent requests takeover; d on an attached agent requests detach", async () => {
 	// takeover: enter closes the panel and reports the agent id upward.

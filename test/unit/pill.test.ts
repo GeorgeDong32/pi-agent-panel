@@ -8,6 +8,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { pillLine, shouldYieldPill } from "../../extensions/lib/pill.ts";
+import { createHarness, type FakeRpcSession } from "./fake-rpc.ts";
+
+async function spawnAgent(h: ReturnType<typeof createHarness>, name: string) {
+	return h.supervisor.spawn({ name, cwd: process.cwd(), prompt: "go" });
+}
 
 const fakeTheme = {
 	fg: (_name: string, text: string) => text,
@@ -55,4 +60,29 @@ test("pillLine shows working/awaiting counts; idle stays dim", () => {
 	assert.ok(busy[0]?.includes("agent-panel"));
 	const idle = pillLine(0, 0, fakeTheme);
 	assert.ok(idle[0]?.includes("idle"));
+});
+
+test("roster(): change-derived snapshot — counts match, cached between changes (plan A9)", async () => {
+	const h = createHarness();
+	await spawnAgent(h, "a");
+	await spawnAgent(h, "b");
+	const session = h.sessions[0] as FakeRpcSession;
+	session.emit({ type: "agent_start" });
+
+	// Consistency: the snapshot's counts equal list()-derived counts.
+	const list = h.supervisor.list();
+	const snapshot = h.supervisor.roster();
+	assert.equal(snapshot.working, list.filter((x) => x.state === "working" || x.state === "starting").length);
+	assert.equal(snapshot.awaiting, list.filter((x) => x.state === "awaiting-input").length);
+	assert.equal(snapshot.archived, list.filter((x) => x.state === "archived" || x.state === "crashed").length);
+	assert.ok(snapshot.working + snapshot.awaiting + snapshot.archived === list.length);
+
+	// Caching: no change between calls → the exact same snapshot object.
+	const again = h.supervisor.roster();
+	assert.equal(again, snapshot, "cached snapshot identity while nothing changed");
+
+	// A change invalidates the cache.
+	session.emit({ type: "agent_end", willRetry: false });
+	const next = h.supervisor.roster();
+	assert.notEqual(next, snapshot, "snapshot recomputed after a change");
 });

@@ -1,6 +1,6 @@
 {
   "name": "pi-agent-panel",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Actionable multi-agent fleet panel for the pi coding agent: run background rpc agent sessions, jump into any of them and keep talking — the Claude Code agent-panel experience in one terminal",
   "type": "module",
   "keywords": [
